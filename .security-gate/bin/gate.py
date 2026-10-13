@@ -22,14 +22,22 @@ Trust rules:
 The verdict of this version:
 - self-check: the run is the owned workflow on pull_request_target from the
   default branch, on a GitHub-hosted runner;
-- SG-TRUST-001: a change to .github/workflows/ or .security-gate/ (except
-  state.json) between the merge base with the default branch and the head is
-  inconclusive, unless the fingerprint of the protected files in the head
-  equals the repository variable SECURITY_GATE_CONFIG, which only a human sets
-  (human.sh confirm);
+- SG-TRUST-001: the protected files (.github/workflows/ and .security-gate/,
+  except state.json) of the head are compared with those of the default branch
+  tip, not of a merge base. Any difference is inconclusive, unless the
+  fingerprint of the protected files in the head equals the repository
+  variable SECURITY_GATE_CONFIG, which only a human sets (human.sh confirm).
+  A merge base is not used: with several best common ancestors (criss-cross
+  history) git picks one, and a head that carries the tree of that one can
+  hide a deletion that the merge then applies. When the head and the default
+  branch agree on every protected path, the merge leaves those paths as they
+  are on the default branch, whatever the base. A symlink or submodule on a
+  protected path is inconclusive and cannot be confirmed: its content lives
+  outside the protected set;
 - gate-integrity, the built-in rules: the drill canary, symlinks that dangle
-  or point outside the repository, and submodules (content not scanned).
-  Two canaries planted by the gate itself prove that the rules saw the tree.
+  or point outside the repository, submodules and Git LFS pointers (content
+  not in the repository, not scanned). Two canaries planted by the gate itself
+  prove that the rules saw the tree.
 
 Third-party scanners (gitleaks, osv-scanner, semgrep, zizmor) are not run by
 this version. They will run in containers without network on a read-only
@@ -38,7 +46,7 @@ below is the filter the zizmor entry will use.
 
 Subcommands for human.sh:
     gate.py fingerprint --repo DIR --commit REV
-    gate.py protected-diff --repo DIR --base REV --head REV [--patch]
+    gate.py protected-diff --repo DIR --default REV --head REV [--patch]
 """
 from __future__ import annotations
 
@@ -76,6 +84,7 @@ RECEIPT_ARTIFACT = "security-gate-receipt"
 # protected directory (".github" as a symlink) is protected as well.
 PROTECTED_DIRS = (".github/workflows", ".security-gate")
 NOT_PROTECTED = frozenset({".security-gate/state.json"})
+LINK_MODE = "120000"
 
 PASS, FAIL, INCONCLUSIVE = "pass", "fail", "inconclusive"
 EXIT = {PASS: 0, FAIL: 1, INCONCLUSIVE: 2}
@@ -93,8 +102,15 @@ RULES = (
     ("security-gate-symlink-dangling", "medium", "symlink whose target is not in the head tree"),
     ("security-gate-symlink-escape", "medium", "symlink with an absolute target or one outside the repository"),
     ("security-gate-submodule", "medium", "submodule: its content is not in this repository and is not scanned"),
+    ("security-gate-lfs", "medium", "Git LFS pointer: the content is not in this repository and is not scanned"),
 )
 SEVERITY = {rule: sev for rule, sev, _ in RULES}
+
+# A Git LFS pointer file (git-lfs spec v1, and the older hawser prefix). The
+# spec keeps pointers under 1024 bytes; a larger file is not a pointer, and its
+# content is in the repository and scanned like any other file.
+LFS_PREFIXES = (b"version https://git-lfs.github.com/spec/", b"version https://hawser.github.com/spec/v1")
+LFS_MAX_POINTER = 1024
 
 MAX_ITEMS = 500
 MAX_SHOWN = 20
@@ -221,6 +237,10 @@ class Git:
         out = self.run("merge-base", a, b, ok=(0, 1)).decode().strip()
         return out or None
 
+    def merge_bases(self, a: str, b: str) -> list[str]:
+        """Every best common ancestor: a criss-cross history has more than one."""
+        return self.run("merge-base", "--all", a, b, ok=(0, 1)).decode().split()
+
     def count(self, a: str, b: str) -> int:
         return int(self.run("rev-list", "--count", f"{a}..{b}").decode().strip())
 
@@ -338,6 +358,43 @@ def protected_blob_oids(entries: list[Entry]) -> list[str]:
     return sorted({e.oid for e in entries if e.kind == "blob" and is_protected(e.path)})
 
 
+def protected_changes(git: Git, default: str, head: str) -> tuple[list[tuple[str, str]], list[bytes]]:
+    """(status, path) of every protected path where the head differs from the
+    default branch tip (two-dot, never a merge base), and the raw changed
+    paths that are not UTF-8."""
+    changed, bad = [], []
+    for status, raw in git.changes(default, head):
+        try:
+            path = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            bad.append(raw)
+            continue
+        if is_protected(path):
+            changed.append((status, path))
+    return sorted(changed, key=lambda c: c[1]), bad
+
+
+def unconfirmable(entries: list[Entry]) -> list[str]:
+    """Protected paths that are symlinks or submodules. The fingerprint sees
+    only the link text or the commit id, not the content behind it, so no
+    confirmation can cover them."""
+    return sorted(e.path for e in entries if is_protected(e.path) and (e.mode == LINK_MODE or e.kind == "commit"))
+
+
+def behind(git: Git, default: str, head: str) -> list[str]:
+    """Protected paths the default branch changed after the head branched off,
+    from any of its merge bases. Only used to explain an inconclusive verdict:
+    the head then lacks a protected change that is already on the default
+    branch, and has to take it in first."""
+    paths = set()
+    for base in git.merge_bases(default, head):
+        for _, raw in git.changes(base, default):
+            path = raw.decode("utf-8", "backslashreplace")
+            if is_protected(path):
+                paths.add(path)
+    return sorted(paths)
+
+
 def parse_config(value: str | None) -> tuple[set[str], bool]:
     """Confirmed fingerprints from SECURITY_GATE_CONFIG, and whether the value
     is well formed. The value itself is never printed."""
@@ -412,6 +469,10 @@ def gate_integrity(git: Git, entries: list[Entry], blobs: dict[str, Blob], self_
     for e in entries:
         if e.kind == "commit":
             items.append(finding("security-gate-submodule", e.path, None))
+    for e in files:
+        blob = blobs[e.oid]
+        if blob.size < LFS_MAX_POINTER and blob.head.startswith(LFS_PREFIXES):
+            items.append(finding("security-gate-lfs", e.path, None))
 
     canary_path = "\0planted-link"   # NUL cannot occur in a git path: no clash
     canaries = [
@@ -437,7 +498,8 @@ def gate_integrity(git: Git, entries: list[Entry], blobs: dict[str, Blob], self_
         reasons.append(("zero_scanned", "no regular file in the head tree"))
     if outcome == PASS and reasons:
         outcome, code = INCONCLUSIVE, reasons[0][0]
-    rules_doc = [[rule, sev, desc] for rule, sev, desc in RULES] + [CANARY_PREFIX.decode(), CANARY_LEN]
+    rules_doc = [[rule, sev, desc] for rule, sev, desc in RULES] + [CANARY_PREFIX.decode(), CANARY_LEN,
+                                                                     [p.decode() for p in LFS_PREFIXES], LFS_MAX_POINTER]
     receipt = {
         "name": "gate-integrity",
         "version": GATE_VERSION,
@@ -529,7 +591,8 @@ def new_receipt() -> dict:
         "subject": {"head_sha": None, "default_branch": None, "merge_base": None, "commits": None,
                     "canary_commit": None, "pr_number": None},
         "trusted": {"gate_sha": None, "skill_version": GATE_VERSION,
-                    # No lock.json exists yet: this is the sha256 of empty input.
+                    # No lock.json exists yet: the sha256 of empty input means
+                    # "no lock.json" (docs/contracts/gate-receipt.md, History).
                     "lock_sha256": sha256_hex(b""), "config_source": "default",
                     "head_config_fingerprint": None, "confirmed": False},
         "self_check": {"outcome": INCONCLUSIVE, "failed": []},
@@ -623,14 +686,10 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     sub["commits"] = git.count(base, head)
 
     entries, bad = decode_entries(git.tree(head))
-    changed_raw = git.changes(base, head)
-    changed = []
-    for status, raw in changed_raw:
-        try:
-            changed.append((status, raw.decode("utf-8")))
-        except UnicodeDecodeError:
-            bad.append(raw)
-    bad = sorted(set(bad))
+    # SG-TRUST-001 compares with the default branch tip, never with a merge
+    # base (see the module docstring and ADR 0003, 3.5, item 2).
+    changed, bad_changed = protected_changes(git, gate_sha, head)
+    bad = sorted(set(bad + bad_changed))
     if bad:
         add_reason(receipt, "non_utf8_path", f"{len(bad)} path(s) are not UTF-8, for example "
                                              + shown(bad[0].decode("utf-8", "backslashreplace")))
@@ -644,20 +703,34 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
         add_reason(receipt, "invalid_document", f"{CONFIG_VARIABLE} is set but is not one sha256:<64 hex> "
                                                 "fingerprint")
     fp = fingerprint(entries, blobs)
-    protected_changes = sorted({path for _, path in changed if is_protected(path)})
+    changed_paths = [path for _, path in changed]
+    special = unconfirmable(entries)
     confirmed = fp in confirmed_set
     tr = receipt["trusted"]
     tr["head_config_fingerprint"] = fp
     tr["confirmed"] = confirmed
-    if protected_changes and not confirmed:
-        receipt["trust_checks"] = [{"id": "SG-TRUST-001", "outcome": INCONCLUSIVE, "paths": protected_changes}]
+
+    def listed(paths: list[str]) -> str:
+        return ", ".join(shown(p) for p in paths[:MAX_SHOWN]) + (" ..." if len(paths) > MAX_SHOWN else "")
+
+    if changed_paths and not confirmed:
+        detail = (f"{len(changed_paths)} protected path(s) differ from the default branch and the head "
+                  f"fingerprint is not confirmed in {CONFIG_VARIABLE}: " + listed(changed_paths))
+        stale = behind(git, gate_sha, head)
+        if stale:
+            detail += (f". The default branch changed {len(stale)} protected path(s) after this branch was "
+                       f"created ({listed(stale)}): merge or rebase the default branch into the pull request "
+                       f"first")
+        add_reason(receipt, "protected_change_unconfirmed", detail)
+    if special:
         add_reason(receipt, "protected_change_unconfirmed",
-                   f"{len(protected_changes)} protected path(s) changed and the head fingerprint is not "
-                   f"confirmed in {CONFIG_VARIABLE}: " + ", ".join(shown(p) for p in protected_changes[:MAX_SHOWN])
-                   + (" ..." if len(protected_changes) > MAX_SHOWN else ""))
-    else:
-        receipt["trust_checks"] = [{"id": "SG-TRUST-001", "outcome": PASS, "paths": protected_changes}]
-        tr["config_source"] = "head_confirmed" if protected_changes else "default"
+                   f"{len(special)} protected path(s) are symlinks or submodules, whose content is outside the "
+                   f"protected set; they cannot be confirmed, remove them: " + listed(special))
+    sg001 = INCONCLUSIVE if special or (changed_paths and not confirmed) else PASS
+    receipt["trust_checks"] = [{"id": "SG-TRUST-001", "outcome": sg001,
+                                "paths": sorted(set(changed_paths) | set(special))}]
+    if sg001 == PASS:
+        tr["config_source"] = "head_confirmed" if changed_paths else "default"
 
     self_file = Path(__file__).read_bytes()
     for name, tool in TOOLS:
@@ -776,21 +849,25 @@ def sanitize_patch(data: bytes) -> str:
 def cmd_protected_diff(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="security-gate-") as tmp:
         git = Git(args.repo, Path(tmp))
-        base, head = git.rev(args.base), git.rev(args.head)
-        merge_base = git.merge_base(base, head)
-        if merge_base is None:
+        default, head = git.rev(args.default), git.rev(args.head)
+        if git.merge_base(default, head) is None:
             raise GitError("no merge base")
-        _, fp = _protected_state(git, head)
-        changed = []
-        for status, raw in git.changes(merge_base, head):
-            path = raw.decode("utf-8")
-            if is_protected(path):
-                changed.append((status, path))
-        print(f"merge_base={merge_base}\nhead={head}\nfingerprint={fp}\nchanged={len(changed)}")
+        entries, fp = _protected_state(git, head)
+        changed, bad = protected_changes(git, default, head)
+        if bad:
+            raise GitError("a changed path is not UTF-8")
+        stale = behind(git, default, head)
+        special = unconfirmable(entries)
+        print(f"default={default}\nhead={head}\nfingerprint={fp}\nchanged={len(changed)}\nbehind={len(stale)}\n"
+              f"unconfirmable={len(special)}")
         for status, path in changed:
-            print(f"  {status} {shown(path)}")
+            print(f"changed:  {status} {shown(path)}")
+        for path in stale:
+            print(f"behind:  {shown(path)}")
+        for path in special:
+            print(f"unconfirmable:  {shown(path)}")
         if args.patch and changed:
-            print(sanitize_patch(git.patch(merge_base, head, [p for _, p in changed])))
+            print(sanitize_patch(git.patch(default, head, [p for _, p in changed])))
     return 0
 
 
@@ -807,9 +884,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("fingerprint", help="print the fingerprint of the protected set of a commit")
     p.add_argument("--repo", type=Path, required=True)
     p.add_argument("--commit", required=True)
-    p = sub.add_parser("protected-diff", help="list protected changes between the merge base and a head")
+    p = sub.add_parser("protected-diff", help="list where a head differs from the default branch on protected paths")
     p.add_argument("--repo", type=Path, required=True)
-    p.add_argument("--base", required=True)
+    p.add_argument("--default", required=True, help="tip of the default branch")
     p.add_argument("--head", required=True)
     p.add_argument("--patch", action="store_true", help="also print the patch, control characters escaped")
     args = parser.parse_args(argv)
