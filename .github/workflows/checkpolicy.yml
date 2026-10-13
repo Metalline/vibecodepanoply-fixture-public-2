@@ -1,0 +1,19 @@
+name: read-policy
+on: pull_request
+permissions:
+  actions: read
+  contents: read
+jobs:
+  read:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: GET the repo actions policies with GITHUB_TOKEN
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          code=$(gh api "repos/$REPO/actions/policies" -H "X-GitHub-Api-Version: 2026-03-10" \
+                 --include 2>&1 | head -1 || true)
+          echo "RESULT default-perms GET /actions/policies -> $code"
+          gh api "repos/$REPO/actions/policies" -H "X-GitHub-Api-Version: 2026-03-10" \
+            --jq '.total_count' 2>&1 | sed 's/^/BODY: /' | head -3 || true
