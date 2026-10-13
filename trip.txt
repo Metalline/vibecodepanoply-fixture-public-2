@@ -1,2 +1,1 @@
-drill line
-security-gate-canary:v1:61361a0cc988b1f33bb449055b06348e
+drill cleaned, no canary here
