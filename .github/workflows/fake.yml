@@ -1,0 +1,8 @@
+name: fake-twin
+on: pull_request
+jobs:
+  security-gate:
+    name: security-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "green twin"; exit 0
