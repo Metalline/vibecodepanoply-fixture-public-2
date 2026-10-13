@@ -1,0 +1,9 @@
+name: fake-twin
+on: pull_request
+jobs:
+  security-gate:
+    name: security-gate
+    if: false
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "should never run"; exit 0
