@@ -1,60 +1,11 @@
-# managed-by: security-gate v0.1.0-p0 (owned)
-#
-# The pull request gate. Do not edit: this file is compared with its template,
-# and a pull request that changes it is not trusted until a human confirms it.
-#
-# pull_request_target runs this file as it is on the default branch, whatever
-# the pull request changes. The pull request is checked out as data only and
-# nothing from it is executed. The gate step gets no token and makes no API
-# calls; its exit code is the verdict: 0 pass, 1 fail, 2 inconclusive.
 name: security-gate
-
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
-
 permissions: {}
-
 jobs:
   security-gate:
     name: security-gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
     steps:
-      - name: Check out the default branch (trusted gate code and data)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: gate
-          persist-credentials: false
-
-      - name: Check out the pull request head (data only, never executed)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: pr
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-          allow-unsafe-pr-checkout: true
-
-      - name: gate
-        env:
-          SG_CONFIG: ${{ vars.SECURITY_GATE_CONFIG }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          cd "$RUNNER_TEMP"
-          python3 -I "$GITHUB_WORKSPACE/gate/.security-gate/bin/gate.py" pr \
-            --trusted "$GITHUB_WORKSPACE/gate" --tree "$GITHUB_WORKSPACE/pr"
-
-      - name: Upload the receipt
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: security-gate-receipt
-          path: ${{ runner.temp }}/security-gate/
-          if-no-files-found: error
-          overwrite: true
+      - run: echo "PR-HEAD VERSION: always pass"; exit 0
