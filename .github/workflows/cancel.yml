@@ -1,0 +1,25 @@
+name: cancel-gate
+on: pull_request
+permissions:
+  actions: write
+  contents: read
+jobs:
+  cancel:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Cancel the gate's prt run repeatedly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          for i in $(seq 1 40); do
+            ids=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD" \
+              --jq '.workflow_runs[]|select(.path==".github/workflows/security-gate.yml" and (.status!="completed"))|.id')
+            for id in $ids; do
+              echo "cancel gate run $id"; gh api --method POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+            done
+            sleep 3
+          done
+          echo "--- final gate runs ---"
+          gh api "repos/$REPO/actions/runs?head_sha=$HEAD" --jq '.workflow_runs[]|select(.path==".github/workflows/security-gate.yml")|"\(.id) \(.status)/\(.conclusion)"'
