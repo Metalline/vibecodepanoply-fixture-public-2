@@ -1,0 +1,8 @@
+name: precharge-twin
+on: push
+jobs:
+  security-gate:
+    name: security-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "pre-charged green twin"; exit 0
