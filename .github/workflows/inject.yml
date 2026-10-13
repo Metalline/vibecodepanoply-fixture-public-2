@@ -1,0 +1,22 @@
+name: inject-x02
+on: pull_request
+permissions:
+  checks: write
+  contents: read
+jobs:
+  inject:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create a security-gate=success check-run via the workflow token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "create attempt (app token, checks: write)"
+          gh api --method POST "repos/$REPO/check-runs" \
+            -f name=security-gate -f head_sha="$HEAD" -f status=completed -f conclusion=success \
+            --jq '{id,name,conclusion,app:.app.id,suite:.check_suite.id}' 2>create.err \
+            && echo "CREATE ok" || { echo "CREATE failed:"; cat create.err; }
+          echo "--- check-runs on head now ---"
+          gh api "repos/$REPO/commits/$HEAD/check-runs" --jq '.check_runs[]|"\(.name) | \(.conclusion) | id=\(.id) | suite=\(.check_suite.id)"'
