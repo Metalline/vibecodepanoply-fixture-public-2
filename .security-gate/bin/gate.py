@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-p0 (owned)
+# managed-by: security-gate v0.1.0-a1 (owned)
 """security-gate: the pull request gate. Standard library only, Python 3.11+.
 
 The owned workflow .github/workflows/security-gate.yml runs this file from a
@@ -36,13 +36,20 @@ The verdict of this version:
   outside the protected set;
 - gate-integrity, the built-in rules: the drill canary, symlinks that dangle
   or point outside the repository, submodules and Git LFS pointers (content
-  not in the repository, not scanned). Two canaries planted by the gate itself
-  prove that the rules saw the tree.
-
-Third-party scanners (gitleaks, osv-scanner, semgrep, zizmor) are not run by
-this version. They will run in containers without network on a read-only
-mount of the head tree, each adding one entry to TOOLS. zizmor_post_filter
-below is the filter the zizmor entry will use.
+  not in the repository, not scanned), and scanner configuration or ignore
+  files, which the scanners below never read. Two canaries planted by the gate
+  itself prove that the rules saw the tree;
+- the scanners pinned in .security-gate/lock.json (taken from the default
+  branch, or from the head once SG-TRUST-001 passed), each run as a container
+  by digest: gitleaks on the head tree and on the commits of the pull request
+  (each file also under a name of the gate's, so that no path allowlist of
+  gitleaks skips it), osv-scanner on the lock files of the head, zizmor on
+  its workflows. A
+  container that reads pull request data has no network and a read-only view
+  of it; the one container with network downloads the vulnerability database
+  and sees no pull request data. No scanner reads a configuration or an ignore
+  list from the pull request. Each scanner finds a canary of the gate in the
+  same call that scans the pull request, or the result is inconclusive.
 
 Subcommands for human.sh:
     gate.py fingerprint --repo DIR --commit REV
@@ -57,6 +64,9 @@ import json
 import os
 import posixpath
 import re
+import secrets
+import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -64,18 +74,22 @@ import threading
 import time
 import traceback
 import unicodedata
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GATE_VERSION = "0.1.0-p0"
+GATE_VERSION = "0.1.0-a1"
 RECEIPT_SCHEMA = "security-gate/receipt"
-RECEIPT_SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 2
 FINGERPRINT_SCHEMA = "security-gate/fingerprint"
 FINGERPRINT_SCHEMA_VERSION = 1
+LOCK_SCHEMA = "security-gate/lock"
+LOCK_SCHEMA_VERSION = 1
 
 EVENT = "pull_request_target"
 WORKFLOW_PATH = ".github/workflows/security-gate.yml"
 GATE_PATH = ".security-gate/bin/gate.py"
+LOCK_PATH = ".security-gate/lock.json"
 CONFIG_VARIABLE = "SECURITY_GATE_CONFIG"
 RECEIPT_ARTIFACT = "security-gate-receipt"
 
@@ -85,10 +99,13 @@ RECEIPT_ARTIFACT = "security-gate-receipt"
 PROTECTED_DIRS = (".github/workflows", ".security-gate")
 NOT_PROTECTED = frozenset({".security-gate/state.json"})
 LINK_MODE = "120000"
+FILE_MODES = frozenset({"100644", "100755"})
 
 PASS, FAIL, INCONCLUSIVE = "pass", "fail", "inconclusive"
 EXIT = {PASS: 0, FAIL: 1, INCONCLUSIVE: 2}
 FAIL_CODES = frozenset({"finding", "exception_expired"})
+SEVERITIES = ("critical", "high", "medium", "low", "info")
+RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 # The drill canary: "security-gate-canary:v1:" and 32 lowercase hex digits.
 # It is assembled here so that this file never contains a canary itself.
@@ -97,12 +114,21 @@ CANARY_PREFIX = (CANARY_RULE + ":v1:").encode()
 CANARY_RE = re.compile(re.escape(CANARY_PREFIX) + rb"[0-9a-f]{32}")
 CANARY_LEN = len(CANARY_PREFIX) + 32
 
+# Files a scanner would read as its configuration or ignore list if it were
+# run the usual way. The gate never lets a scanner read them (see each
+# scanner), so a pull request cannot quiet a scanner with one; the file is
+# reported, because it suppresses nothing and only looks as if it did.
+SCANNER_CONFIG_NAMES = frozenset({".gitleaksignore", ".gitleaks.toml", "osv-scanner.toml", "zizmor.yml",
+                                  "zizmor.yaml"})
+
 RULES = (
     (CANARY_RULE, "high", "drill canary in a file of the head tree"),
     ("security-gate-symlink-dangling", "medium", "symlink whose target is not in the head tree"),
     ("security-gate-symlink-escape", "medium", "symlink with an absolute target or one outside the repository"),
     ("security-gate-submodule", "medium", "submodule: its content is not in this repository and is not scanned"),
     ("security-gate-lfs", "medium", "Git LFS pointer: the content is not in this repository and is not scanned"),
+    ("security-gate-scanner-config", "medium",
+     "scanner configuration or ignore file: the gate does not read it and it suppresses nothing; remove it"),
 )
 SEVERITY = {rule: sev for rule, sev, _ in RULES}
 
@@ -114,8 +140,12 @@ LFS_MAX_POINTER = 1024
 
 MAX_ITEMS = 500
 MAX_SHOWN = 20
+MAX_PATHS = 50
 CHUNK = 1 << 20
 MAX_LINK_TARGET = 4096
+MAX_LOCK_BYTES = 1 << 20
+MAX_SCANNED_FILE = 128 << 20
+MAX_RECORD = 4 << 20
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -157,6 +187,10 @@ def is_protected(path: str) -> bool:
     return any(low == d or low.startswith(d + "/") or d.startswith(low + "/") for d in PROTECTED_DIRS)
 
 
+def listed(paths: list[str]) -> str:
+    return ", ".join(shown(p) for p in paths[:MAX_SHOWN]) + (" ..." if len(paths) > MAX_SHOWN else "")
+
+
 # ---------------------------------------------------------------------------
 # Git, objects only
 # ---------------------------------------------------------------------------
@@ -170,6 +204,9 @@ _GIT_CONFIG = (
     "core.attributesFile=" + os.devnull, "diff.external=", "diff.noprefix=false", "core.pager=cat",
     "protocol.allow=never", "credential.helper=", "gc.auto=0", "maintenance.auto=false",
 )
+# The identity of the objects the gate writes itself (the gitleaks snapshot).
+_GATE_IDENTITY = {"GIT_AUTHOR_NAME": "security-gate", "GIT_AUTHOR_EMAIL": "security-gate@invalid",
+                  "GIT_COMMITTER_NAME": "security-gate", "GIT_COMMITTER_EMAIL": "security-gate@invalid"}
 
 
 @dataclass(frozen=True)
@@ -186,6 +223,56 @@ class Blob:
     sha256: str = ""
     canary_lines: list[int] = field(default_factory=list)
     head: bytes = b""
+    nul: bool = False   # a NUL byte anywhere: git's "binary"
+
+
+@dataclass(frozen=True)
+class Change:
+    """A regular file that a commit of the pull request adds or changes. A
+    merge commit has one Change per parent for each file that differs from
+    all its parents."""
+    commit: str
+    path: str
+    old: str | None     # the blob before (its parent's, or a rename source), None if the file is new
+    new: str            # the blob the commit wrote
+    parent: int = 0     # which parent old belongs to
+    parents: int = 1    # how many parents the commit has
+
+
+ZERO_OID = "0" * 40
+
+
+def raw_records(out: bytes) -> list[tuple[list[str], list[str], str, bytes]]:
+    """(modes, oids, status, path) from `diff-tree -r -z --raw --no-abbrev`
+    output; modes and oids end with the result, a rename or copy keeps its
+    destination path."""
+    parts = out.split(b"\0")
+    records, i = [], 0
+    while i < len(parts):
+        meta = parts[i]
+        if not meta:
+            i += 1
+            continue
+        if not meta.startswith(b":") or i + 1 >= len(parts):
+            raise GitError("diff-tree output is not raw records")
+        n = len(meta) - len(meta.lstrip(b":"))
+        fields = meta[n:].decode("ascii").split(" ")
+        if len(fields) != 2 * n + 3:
+            raise GitError("diff-tree output is not raw records")
+        modes, oids, status = fields[:n + 1], fields[n + 1:2 * n + 2], fields[2 * n + 2]
+        if n == 1 and status[:1] in ("R", "C"):
+            path, i = parts[i + 2], i + 3
+        else:
+            path, i = parts[i + 1], i + 2
+        records.append((modes, oids, status, path))
+    return records
+
+
+def git_environ(home: Path) -> dict[str, str]:
+    keep = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "TMPDIR")}
+    return dict(keep, HOME=str(home), LC_ALL="C", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                GIT_ATTR_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
+                GIT_NO_LAZY_FETCH="1", GIT_ADVICE="0")
 
 
 class Git:
@@ -197,11 +284,7 @@ class Git:
         worktree.mkdir(parents=True, exist_ok=True)
         home = scratch / "home"
         home.mkdir(parents=True, exist_ok=True)
-        keep = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "TMPDIR")}
-        self.environ = dict(keep, HOME=str(home), LC_ALL="C", GIT_CONFIG_NOSYSTEM="1",
-                            GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1",
-                            GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1",
-                            GIT_ADVICE="0")
+        self.environ = git_environ(home)
         repo = Path(repo).absolute()
         # The ceiling stops git from taking a parent directory's repository.
         probe = dict(self.environ, GIT_CEILING_DIRECTORIES=str(repo.parent))
@@ -209,15 +292,20 @@ class Git:
                               timeout=60, check=False, env=probe)
         if proc.returncode != 0:
             raise GitError("not a git repository")
-        git_dir = proc.stdout.decode("utf-8", "surrogateescape").strip()
-        self.prefix = ["git", "--git-dir=" + git_dir, "--work-tree=" + str(worktree), "--literal-pathspecs"]
+        self.git_dir = Path(proc.stdout.decode("utf-8", "surrogateescape").strip())
+        self.prefix = ["git", "--git-dir=" + str(self.git_dir), "--work-tree=" + str(worktree), "--literal-pathspecs"]
         for item in _GIT_CONFIG:
             self.prefix += ["-c", item]
 
-    def run(self, *args: str, data: bytes | None = None, ok: tuple[int, ...] = (0,)) -> bytes:
+    @property
+    def objects(self) -> Path:
+        return self.git_dir / "objects"
+
+    def run(self, *args: str, data: bytes | None = None, ok: tuple[int, ...] = (0,),
+            extra: dict[str, str] | None = None) -> bytes:
         try:
             proc = subprocess.run(self.prefix + list(args), input=data, capture_output=True, timeout=600,
-                                  check=False, env=self.environ)
+                                  check=False, env=dict(self.environ, **(extra or {})))
         except (OSError, subprocess.SubprocessError) as exc:
             raise GitError(f"git {args[0]} could not run: {type(exc).__name__}") from None
         if proc.returncode not in ok:
@@ -256,6 +344,26 @@ class Git:
             result.append((mode, kind, oid, raw))
         return result
 
+    def root_records(self, commit: str) -> list[bytes]:
+        """The raw ls-tree -z records of the root tree of a commit."""
+        return [rec for rec in self.run("ls-tree", "-z", "--full-tree", commit).split(b"\0") if rec]
+
+    def entry_at(self, commit: str, path: str) -> tuple[str, str, str] | None:
+        """(mode, kind, oid) of the entry at a path of a commit, or None."""
+        out = self.run("ls-tree", "-z", "--full-tree", commit, "--", path)
+        for rec in out.split(b"\0"):
+            meta, _, raw = rec.partition(b"\t")
+            if rec and raw == path.encode("utf-8"):
+                mode, kind, oid = meta.decode("ascii").split(" ")
+                return mode, kind, oid
+        return None
+
+    def blob_bytes(self, oid: str, limit: int) -> bytes:
+        size = int(self.run("cat-file", "-s", oid).decode().strip())
+        if size > limit:
+            raise GitError(f"a blob of {size} bytes is larger than the {limit} bytes the gate reads")
+        return self.run("cat-file", "blob", oid)
+
     def changes(self, a: str, b: str) -> list[tuple[str, bytes]]:
         """(status, raw path) for every changed non-tree entry, renames split."""
         out = self.run("diff-tree", "-r", "--no-renames", "--no-ext-diff", "--no-textconv", "--name-status",
@@ -269,6 +377,62 @@ class Git:
 
     def write_blob(self, data: bytes) -> str:
         return self.run("hash-object", "-w", "--no-filters", "--stdin", data=data).decode().strip()
+
+    def mktree(self, records: list[bytes]) -> str:
+        """A tree from raw ls-tree -z records; entries may live in alternates."""
+        return self.run("mktree", "-z", "--missing", data=b"".join(r + b"\0" for r in records)).decode().strip()
+
+    def commit_tree(self, tree: str, message: str, parents: tuple[str, ...] = ()) -> str:
+        args = [a for p in parents for a in ("-p", p)]
+        return self.run("commit-tree", tree, *args, "-m", message, extra=_GATE_IDENTITY).decode().strip()
+
+    def pr_changes(self, head: str, base: str) -> list[Change]:
+        """Every regular file a non-merge commit of base..head adds or
+        changes, against its first parent, with renames detected as git log
+        detects them. Deletions are left out: they add no content.
+
+        A merge commit adds content of its own only where its file differs
+        from every parent ("evil merge"; `git log -p` shows merges without a
+        diff, so gitleaks never sees it). For each such file there is one
+        Change per parent; a line counts as added by the merge only if it is
+        added against every parent (judge_gitleaks)."""
+        changes = []
+        for commit in self.run("rev-list", "--no-merges", head, "^" + base).decode().split():
+            out = self.run("diff-tree", "-r", "-z", "-M", "--root", "--raw", "--no-abbrev", "--no-commit-id",
+                           "--no-ext-diff", "--no-textconv", commit)
+            for modes, oids, status, raw in raw_records(out):
+                if status[:1] == "D" or modes[-1] not in FILE_MODES:
+                    continue
+                old = oids[0] if oids[0] != ZERO_OID and modes[0] in FILE_MODES | {LINK_MODE} else None
+                changes.append(Change(commit, raw.decode("utf-8", "backslashreplace"), old, oids[-1]))
+        for commit in self.run("rev-list", "--merges", head, "^" + base).decode().split():
+            # -c lists only the files that differ from all parents.
+            out = self.run("diff-tree", "-r", "-z", "-c", "--raw", "--no-abbrev", "--no-commit-id", "--no-ext-diff",
+                           "--no-textconv", commit)
+            for modes, oids, _, raw in raw_records(out):
+                if modes[-1] not in FILE_MODES or oids[-1] == ZERO_OID:
+                    continue
+                path, parents = raw.decode("utf-8", "backslashreplace"), len(oids) - 1
+                for i in range(parents):
+                    old = oids[i] if oids[i] != ZERO_OID and modes[i] in FILE_MODES | {LINK_MODE} else None
+                    changes.append(Change(commit, path, old, oids[-1], i, parents))
+        return changes
+
+    def commits_with_additions(self, revs: list[str]) -> int:
+        """Non-merge commits of revs whose diff adds at least one line: the
+        commits gitleaks counts when it reads `git log -p` (it reports fewer
+        for commits that only delete, rename or add binary files)."""
+        out = self.run("log", "--no-merges", "--format=%x01%H", "--numstat", *revs, "--")
+        counted, current = 0, False
+        for line in out.split(b"\n"):
+            if line.startswith(b"\x01"):
+                current = False
+                continue
+            added = line.split(b"\t", 1)[0]
+            if not current and added.isdigit() and int(added) > 0:
+                current = True
+                counted += 1
+        return counted
 
     def patch(self, a: str, b: str, paths: list[str]) -> bytes:
         return self.run("diff", "--no-color", "--text", "--no-ext-diff", "--no-textconv", "--no-renames",
@@ -309,6 +473,7 @@ class Git:
                         raise GitError("cat-file output ended early")
                     remaining -= len(chunk)
                     digest.update(chunk)
+                    blob.nul = blob.nul or b"\0" in chunk
                     if len(blob.head) < MAX_LINK_TARGET + 1:
                         blob.head += chunk[:MAX_LINK_TARGET + 1 - len(blob.head)]
                     buf = tail + chunk
@@ -328,6 +493,44 @@ class Git:
         if code != 0:
             raise GitError(f"git cat-file exited {code}")
         return result
+
+
+def scratch_repository(path: Path, objects: Path, scratch: Path) -> Git:
+    """A bare repository of the gate's own: its config, attributes and refs
+    are the gate's, and it reads the objects of another repository through
+    alternates. `* diff` in info/attributes outranks every .gitattributes and
+    sets the diff attribute on every path, so `git log -p` prints the content
+    of every file as text, even one with NUL bytes, which git would otherwise
+    show as "Binary files differ" and gitleaks would skip. `* !diff` would
+    only restore git's own binary detection."""
+    path.mkdir(parents=True)
+    environ = git_environ(scratch / "init-home")
+    (scratch / "init-home").mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(["git", "init", "--bare", "--quiet", "--template=", str(path)], capture_output=True,
+                          timeout=60, check=False, env=environ)
+    if proc.returncode != 0:
+        raise GitError("git init of the scratch repository failed")
+    (path / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (path / "objects" / "info" / "alternates").write_text(str(objects) + "\n", encoding="utf-8")
+    (path / "info").mkdir(parents=True, exist_ok=True)
+    (path / "info" / "attributes").write_text("* diff\n", encoding="utf-8")
+    return Git(path, scratch)
+
+
+def safe_join(root: Path, rel: str) -> Path | None:
+    """root/rel for a repository path, or None if the path could leave root
+    or carries a control character."""
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts) or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in rel):
+        return None
+    return root.joinpath(*parts)
+
+
+def write_new_file(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +610,327 @@ def parse_config(value: str | None) -> tuple[set[str], bool]:
 
 
 # ---------------------------------------------------------------------------
+# lock.json: the scanners, their images and their thresholds
+# ---------------------------------------------------------------------------
+
+SCANNERS = ("gitleaks", "osv-scanner", "zizmor")
+_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:/[a-z0-9][a-z0-9._-]*)+$")
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$")
+_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_HTTPS_RE = re.compile(r"^https://[!-~]+$")
+_DB_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$")
+ECOSYSTEMS = ("npm", "PyPI")
+
+
+class LockError(Exception):
+    def __init__(self, detail: str, code: str = "invalid_document") -> None:
+        super().__init__(detail)
+        self.code = code
+
+
+def _need(cond: bool, where: str, what: str) -> None:
+    if not cond:
+        raise LockError(f"lock.json: {where} {what}")
+
+
+def _is_int(value: object, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def parse_lock(data: bytes) -> dict:
+    """The validated lock document. Every field the gate uses is required and
+    typed: a typo or a missing threshold is invalid_document, never a default.
+    Unknown fields are ignored (docs/contracts/README.md)."""
+    if not data.strip():
+        raise LockError("lock.json is empty")
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise LockError("lock.json is not JSON in UTF-8") from None
+    _need(isinstance(doc, dict), "the document", "is not an object")
+    _need(doc.get("schema") == LOCK_SCHEMA, "schema", f"is not {LOCK_SCHEMA}")
+    if doc.get("schema_version") != LOCK_SCHEMA_VERSION:
+        raise LockError(f"lock.json: schema_version is not {LOCK_SCHEMA_VERSION}", "unknown_schema_version")
+    tools = doc.get("tools")
+    _need(isinstance(tools, dict) and set(tools) == set(SCANNERS), "tools", "must name exactly " + ", ".join(SCANNERS))
+    for name in SCANNERS:
+        t = tools[name]
+        _need(isinstance(t, dict), name, "is not an object")
+        _need(isinstance(t.get("version"), str) and bool(_VERSION_RE.match(t["version"])), name + ".version",
+              "is not a version")
+        _need(isinstance(t.get("image"), str) and bool(_IMAGE_RE.match(t["image"])), name + ".image",
+              "is not an image name without tag or digest")
+        _need(isinstance(t.get("digest"), str) and bool(_DIGEST_RE.match(t["digest"])), name + ".digest",
+              "is not sha256:<64 hex>")
+        _need(_is_int(t.get("timeout_s"), 30, 3600), name + ".timeout_s", "is not an integer from 30 to 3600")
+        v = t.get("verified")
+        _need(isinstance(v, dict) and isinstance(v.get("on"), str) and bool(_DATE_RE.match(v["on"]))
+              and isinstance(v.get("release"), str) and bool(_HTTPS_RE.match(v["release"]))
+              and isinstance(v.get("evidence"), list) and bool(v["evidence"])
+              and all(isinstance(x, str) for x in v["evidence"]), name + ".verified",
+              "needs on (date), release (https URL) and evidence (strings)")
+        p = t.get("policy")
+        _need(isinstance(p, dict) and p.get("min_severity") in RANK, name + ".policy.min_severity",
+              "is not one of " + ", ".join(SEVERITIES))
+        if name != "gitleaks":
+            _need(p.get("unknown_severity") in RANK, name + ".policy.unknown_severity",
+                  "is not one of " + ", ".join(SEVERITIES))
+        if name == "osv-scanner":
+            _need(isinstance(p.get("require_fix"), bool), name + ".policy.require_fix", "is not a boolean")
+            _need(isinstance(p.get("malicious_fails"), bool), name + ".policy.malicious_fails", "is not a boolean")
+            dbs = t.get("databases")
+            _need(isinstance(dbs, list), name + ".databases", "is not an array")
+            for i, db in enumerate(dbs):
+                where = f"{name}.databases[{i}]"
+                _need(isinstance(db, dict), where, "is not an object")
+                _need(isinstance(db.get("name"), str) and bool(_VERSION_RE.match(db["name"])), where + ".name",
+                      "is not a name")
+                _need(db.get("ecosystem") in ECOSYSTEMS, where + ".ecosystem", "is not one of " + ", ".join(ECOSYSTEMS))
+                _need(isinstance(db.get("source"), str) and bool(_HTTPS_RE.match(db["source"])), where + ".source",
+                      "is not an https URL")
+                _need(isinstance(db.get("path"), str) and bool(_DB_PATH_RE.match(db["path"])), where + ".path",
+                      "is not a relative path")
+                _need(_is_int(db.get("max_age_hours"), 1, 8760), where + ".max_age_hours",
+                      "is not an integer from 1 to 8760")
+            _need(sorted(db["ecosystem"] for db in dbs) == sorted(ECOSYSTEMS), name + ".databases",
+                  "must list exactly one database for each of " + ", ".join(ECOSYSTEMS))
+    return doc
+
+
+def load_lock(git: Git, commit: str) -> tuple[dict | None, bytes | None, tuple[str, str] | None]:
+    """(document, bytes, problem) of lock.json in a commit, read as a git
+    object."""
+    entry = git.entry_at(commit, LOCK_PATH)
+    if entry is None:
+        return None, None, ("invalid_document", f"{LOCK_PATH} is missing, so no scanner can run")
+    mode, kind, oid = entry
+    if kind != "blob" or mode not in FILE_MODES:
+        return None, None, ("invalid_document", f"{LOCK_PATH} is not a regular file")
+    try:
+        data = git.blob_bytes(oid, MAX_LOCK_BYTES)
+    except GitError as exc:
+        return None, None, ("invalid_document", f"{LOCK_PATH}: {exc}")
+    try:
+        return parse_lock(data), data, None
+    except LockError as exc:
+        return None, data, (exc.code, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Containers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Run:
+    code: int | None            # None: the container did not finish
+    out: bytes = b""
+    err: str = ""
+    duration: int = 0
+    timed_out: bool = False
+    retried: bool = False
+    detail: str = ""
+
+
+class Docker:
+    """docker run for scanners: image by digest, pulled before, never pulled
+    by run; no network unless asked; the runner's uid; a read-only root file
+    system with an empty /tmp; no capabilities. The docker client gets an
+    empty configuration directory, so no credential helper is consulted."""
+
+    def __init__(self, scratch: Path) -> None:
+        scratch.mkdir(parents=True, exist_ok=True)
+        (scratch / "config").mkdir(exist_ok=True)
+        (scratch / "home").mkdir(exist_ok=True)
+        self.environ = {"PATH": os.environ.get("PATH", ""), "HOME": str(scratch / "home"),
+                        "DOCKER_CONFIG": str(scratch / "config")}
+        if os.environ.get("DOCKER_HOST"):
+            self.environ["DOCKER_HOST"] = os.environ["DOCKER_HOST"]
+        self.exe = shutil.which("docker", path=self.environ["PATH"])
+        self.pulled: dict[str, str | None] = {}
+
+    def _call(self, args: list[str], timeout: int) -> subprocess.CompletedProcess:
+        return subprocess.run([self.exe, *args], stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                              check=False, env=self.environ)
+
+    def pull(self, ref: str) -> str | None:
+        """None when the image is there, else what went wrong. One retry."""
+        if ref in self.pulled:
+            return self.pulled[ref]
+        problem = "docker is not installed on the runner"
+        if self.exe:
+            for _ in range(2):
+                try:
+                    proc = self._call(["pull", "--quiet", ref], 600)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    problem = f"docker pull could not run: {type(exc).__name__}"
+                    continue
+                if proc.returncode == 0:
+                    problem = None
+                    break
+                problem = f"docker pull exited {proc.returncode}"
+        self.pulled[ref] = problem
+        return problem
+
+    def run(self, ref: str, args: list[str], *, mounts: tuple = (), network: bool = False,
+            variables: dict[str, str] | None = None, timeout: int = 600, ok: tuple[int, ...] = (0,),
+            retry: bool = True) -> Run:
+        """Run once more when the exit code is not one of ok, or on timeout."""
+        result = Run(code=None, detail="docker is not installed on the runner")
+        for attempt in range(2 if retry else 1):
+            result = self._run_once(ref, args, mounts, network, variables or {}, timeout)
+            result.retried = attempt > 0
+            if result.code is not None and result.code in ok:
+                break
+        return result
+
+    def _run_once(self, ref: str, args: list[str], mounts: tuple, network: bool, variables: dict[str, str],
+                  timeout: int) -> Run:
+        if not self.exe:
+            return Run(code=None, detail="docker is not installed on the runner")
+        name = "security-gate-" + os.urandom(8).hex()
+        cmd = ["run", "--rm", "--pull", "never", "--name", name, "--network", "bridge" if network else "none",
+               "--user", f"{os.getuid()}:{os.getgid()}", "--read-only", "--cap-drop", "ALL",
+               "--security-opt", "no-new-privileges", "--tmpfs", "/tmp", "-e", "HOME=/tmp", "-w", "/sg"]
+        for key, value in variables.items():
+            cmd += ["-e", f"{key}={value}"]
+        for host, target, read_only in mounts:
+            if ":" in str(host) or "," in str(host):
+                return Run(code=None, detail="a mount path contains ':' or ','")
+            cmd += ["-v", f"{host}:{target}" + (":ro" if read_only else "")]
+        cmd += [ref, *args]
+        start = time.monotonic()
+        try:
+            proc = self._call(cmd, timeout)
+        except subprocess.TimeoutExpired:
+            for stop in (["kill", name], ["rm", "-f", name]):
+                try:
+                    self._call(stop, 60)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            return Run(code=None, duration=int(time.monotonic() - start), timed_out=True,
+                       detail=f"did not finish in {timeout} s")
+        except (OSError, subprocess.SubprocessError) as exc:
+            return Run(code=None, detail=f"docker run could not run: {type(exc).__name__}")
+        return Run(code=proc.returncode, out=proc.stdout, err=proc.stderr.decode("utf-8", "replace"),
+                   duration=int(time.monotonic() - start))
+
+
+# ---------------------------------------------------------------------------
+# Scanner context, receipts and verdicts
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Scan:
+    git: Git
+    entries: list[Entry]
+    blobs: dict[str, Blob]
+    head: str
+    base: str                   # the default branch tip
+    scratch: Path
+    lock: dict | None
+    docker: Docker
+    confirmed: bool
+    self_file: bytes
+    canary_commit: str | None = None
+
+    def spec(self, name: str) -> dict:
+        return self.lock["tools"][name]
+
+    def ref(self, name: str) -> str:
+        return f"{self.spec(name)['image']}@{self.spec(name)['digest']}"
+
+    def regular_files(self) -> list[Entry]:
+        return [e for e in self.entries if e.kind == "blob" and e.mode in FILE_MODES]
+
+
+_VERSION_ARGS = {"gitleaks": ["version"], "osv-scanner": ["--version"], "zizmor": ["--version"]}
+_VERSION_OUT = {"gitleaks": re.compile(r"^v?(\S+)\s*$"), "osv-scanner": re.compile(r"(?m)^osv-scanner version: (\S+)"),
+                "zizmor": re.compile(r"(?m)^zizmor (\S+)")}
+
+
+def prepare(s: Scan, name: str) -> tuple[str | None, list[tuple[str, str]]]:
+    """(version reported by the image, problems). The image is pulled by
+    digest, and the version it reports must be the one lock.json names."""
+    if s.lock is None:
+        return None, [("tool_missing", f"{name} did not run: {LOCK_PATH} is missing or invalid")]
+    ref = s.ref(name)
+    problem = s.docker.pull(ref)
+    if problem:
+        return None, [("tool_missing", f"{name} did not run: {problem}")]
+    run = s.docker.run(ref, _VERSION_ARGS[name], timeout=120)
+    m = _VERSION_OUT[name].search(run.out.decode("utf-8", "replace")) if run.code == 0 else None
+    if not m:
+        return None, [("tool_error", f"{name} did not report its version (exit {run.code})")]
+    version = m.group(1).removeprefix("v")
+    if version != s.spec(name)["version"]:
+        detail = f"{name} reports version {shown(version)}, lock.json names {s.spec(name)['version']}"
+        return version, [("artifact_mismatch", detail)]
+    return version, []
+
+
+def severity_counts(items: list[dict]) -> dict[str, int]:
+    counts = {sev: 0 for sev in SEVERITIES}
+    for item in items:
+        counts[item["severity"]] += 1
+    return counts
+
+
+def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *, scanned: dict, canaries: list,
+                 markers: list[str], items: list[dict], below: int, problems: list[tuple[str, str]],
+                 rules_loaded: int | None, rules_sha256: str, databases: list | None = None,
+                 fetch: dict | None = None) -> tuple[dict, list[tuple[str, str]]]:
+    """The tool's receipt and its reasons. Findings at or above the threshold
+    are a fail; any problem without such a finding is inconclusive."""
+    reasons = []
+    if items:
+        shown_items = "; ".join(f"{i['rule']} {shown(i['path'])}" + (f":{i['line']}" if i["line"] else "")
+                                for i in items[:MAX_SHOWN])
+        reasons.append(("finding", f"{len(items)} finding(s) at or above {s.spec(name)['policy']['min_severity']}: "
+                                   + shown_items + (" ..." if len(items) > MAX_SHOWN else "")))
+    reasons += problems
+    if items:
+        outcome, code = FAIL, "finding"
+    elif problems:
+        outcome, code = INCONCLUSIVE, problems[0][0]
+    else:
+        outcome, code = PASS, None
+    receipt = {
+        "id": name,
+        "name": name,
+        "version": version,
+        "artifact": {"kind": "oci", "ref": s.spec(name)["image"], "sha256": s.spec(name)["digest"]},
+        "argv": argv,
+        "network": "none",
+        "rules_loaded": rules_loaded,
+        "rules_sha256": rules_sha256,
+        "scanned": scanned,
+        "canaries": canaries,
+        "exit_code": run.code if run.code is not None else -1,
+        "stderr_markers": markers,
+        "retried": run.retried,
+        "findings": {"total": len(items), "by_severity": severity_counts(items), "items": items[:MAX_ITEMS],
+                     "truncated": len(items) > MAX_ITEMS, "below_threshold": below},
+        "databases": databases or [],
+        "fetch": fetch,
+        "outcome": outcome,
+        "reason_code": code,
+        "duration_s": run.duration,
+    }
+    return receipt, reasons
+
+
+def run_problem(name: str, run: Run, ok: tuple[int, ...]) -> list[tuple[str, str]]:
+    if run.timed_out:
+        return [("timeout", f"{name} {run.detail}")]
+    if run.code is None:
+        return [("tool_error", f"{name}: {run.detail}")]
+    if run.code not in ok:
+        return [("tool_error", f"{name} exited {run.code}, which is a failure, not a finding")]
+    return []
+
+
+# ---------------------------------------------------------------------------
 # gate-integrity: built-in rules on the head tree
 # ---------------------------------------------------------------------------
 
@@ -446,8 +970,9 @@ def finding(rule: str, path: str, line: int | None) -> dict:
             "fingerprint": sha256_hex(canonical([rule, path, line]))}
 
 
-def gate_integrity(git: Git, entries: list[Entry], blobs: dict[str, Blob], self_file: bytes) -> dict:
+def gate_integrity(s: Scan) -> dict:
     start = time.monotonic()
+    git, entries, blobs = s.git, s.entries, s.blobs
     nonce = os.urandom(16).hex()
     canary_oid = git.write_blob(b"drill\n" + CANARY_PREFIX + nonce.encode() + b"\n")
     link_oid = git.write_blob(("security-gate-missing-" + nonce).encode())
@@ -473,6 +998,9 @@ def gate_integrity(git: Git, entries: list[Entry], blobs: dict[str, Blob], self_
         blob = blobs[e.oid]
         if blob.size < LFS_MAX_POINTER and blob.head.startswith(LFS_PREFIXES):
             items.append(finding("security-gate-lfs", e.path, None))
+    for e in entries:
+        if posixpath.basename(e.path).lower() in SCANNER_CONFIG_NAMES:
+            items.append(finding("security-gate-scanner-config", e.path, None))
 
     canary_path = "\0planted-link"   # NUL cannot occur in a git path: no clash
     canaries = [
@@ -480,15 +1008,12 @@ def gate_integrity(git: Git, entries: list[Entry], blobs: dict[str, Blob], self_
         {"id": "gate-integrity-symlink", "expected_rule": "security-gate-symlink-dangling",
          "found": resolve_link(canary_path, planted[link_oid].head, links, names, dirs) == "dangling"},
     ]
-    by_severity = {s: 0 for s in ("critical", "high", "medium", "low", "info")}
-    for item in items:
-        by_severity[item["severity"]] += 1
     reasons = []
     if items:
         outcome, code = FAIL, "finding"
-        listed = "; ".join(i["rule"] + " " + shown(i["path"]) + (f":{i['line']}" if i["line"] else "")
-                           for i in items[:MAX_SHOWN])
-        reasons.append(("finding", f"{len(items)} finding(s): {listed}" + (" ..." if len(items) > MAX_SHOWN else "")))
+        shown_items = "; ".join(i["rule"] + " " + shown(i["path"]) + (f":{i['line']}" if i["line"] else "")
+                                for i in items[:MAX_SHOWN])
+        reasons.append(("finding", f"{len(items)} finding(s): {shown_items}" + (" ..." if len(items) > MAX_SHOWN else "")))
     else:
         outcome, code = PASS, None
     missed = [c["id"] for c in canaries if not c["found"]]
@@ -499,23 +1024,27 @@ def gate_integrity(git: Git, entries: list[Entry], blobs: dict[str, Blob], self_
     if outcome == PASS and reasons:
         outcome, code = INCONCLUSIVE, reasons[0][0]
     rules_doc = [[rule, sev, desc] for rule, sev, desc in RULES] + [CANARY_PREFIX.decode(), CANARY_LEN,
-                                                                     [p.decode() for p in LFS_PREFIXES], LFS_MAX_POINTER]
+                                                                     [p.decode() for p in LFS_PREFIXES], LFS_MAX_POINTER,
+                                                                     sorted(SCANNER_CONFIG_NAMES)]
     receipt = {
+        "id": "gate-integrity",
         "name": "gate-integrity",
         "version": GATE_VERSION,
-        "artifact": {"kind": "binary", "ref": GATE_PATH, "sha256": sha256_hex(self_file)},
+        "artifact": {"kind": "binary", "ref": GATE_PATH, "sha256": sha256_hex(s.self_file)},
         "argv": [],
         "network": "none",
         "rules_loaded": len(RULES),
         "rules_sha256": sha256_hex(canonical(rules_doc)),
         "scanned": {"files": len(files), "commits": None, "packages": None, "paths": [""],
-                    "paths_truncated": False, "lockfiles": []},
+                    "paths_truncated": False, "lockfiles": [], "unreadable": None},
         "canaries": canaries,
         "exit_code": 1 if items or any(c["found"] for c in canaries) else 0,
         "stderr_markers": [],
         "retried": False,
-        "findings": {"total": len(items), "by_severity": by_severity, "items": items[:MAX_ITEMS],
-                     "truncated": len(items) > MAX_ITEMS},
+        "findings": {"total": len(items), "by_severity": severity_counts(items), "items": items[:MAX_ITEMS],
+                     "truncated": len(items) > MAX_ITEMS, "below_threshold": 0},
+        "databases": [],
+        "fetch": None,
         "outcome": outcome,
         "reason_code": code,
         "duration_s": int(time.monotonic() - start),
@@ -523,15 +1052,751 @@ def gate_integrity(git: Git, entries: list[Entry], blobs: dict[str, Blob], self_
     return {"receipt": receipt, "reasons": reasons}
 
 
-# Every tool the gate runs, in order. Container scanners join here later.
-TOOLS = (("gate-integrity", gate_integrity),)
+# ---------------------------------------------------------------------------
+# gitleaks: the head tree and the commits of the pull request, one call
+# ---------------------------------------------------------------------------
+
+# The built-in rules, and nothing from the repository: GITLEAKS_CONFIG_TOML
+# outranks a .gitleaks.toml. The ignore path is the empty /tmp, so the only
+# .gitleaksignore gitleaks could read is one in the scratch repository, and
+# that one is the gate's (there is none). gitleaks:allow is not honoured.
+#
+# The built-in configuration also has a global allowlist of paths: images and
+# svg, fonts, pdf and office files, node_modules/, the npm and Python lock
+# files, vendor/, go.mod and go.sum, virtualenvs, any path that contains
+# "gitleaks.toml", and more. gitleaks skips a secret in such a file without a
+# word. The gate does not depend on that list: it gives gitleaks a copy of
+# every file of the head and of every change of the pull request under names
+# of its own (<dir>/h/<n>, <dir>/c/<n>), which no path rule can match, and
+# maps what gitleaks finds there back to the real path. The real paths are
+# scanned as well, for the few rules that apply to some paths only (.tf,
+# .yaml, .php, nuget.config, .p12).
+GITLEAKS_CONFIG = "[extend]\nuseDefault = true\n"
+GITLEAKS_CANARY_RULE = "github-pat"
+GITLEAKS_SEVERITY = "high"   # gitleaks has no severities: every finding gets this one
+_GITLEAKS_COMMITS = re.compile(r"INF (\d+) commits scanned")
+
+
+def github_token_canary() -> str:
+    """A value the built-in github-pat rule matches, made at run time."""
+    alphabet = string.ascii_letters + string.digits
+    return "gh" + "p_" + "".join(secrets.choice(alphabet) for _ in range(36))
+
+
+# Content gitleaks reads but cannot match: its rules look for ASCII in the raw
+# bytes. A file with NUL bytes is still read (see scratch_repository), so an
+# ASCII secret inside a binary file is found; text in UTF-16 or UTF-32, and
+# anything compressed, is not. Recognized by the first bytes of the blob.
+_COMPRESSED = ((b"PK\x03\x04", "zip archive"), (b"PK\x05\x06", "zip archive"), (b"PK\x07\x08", "zip archive"),
+               (b"\x1f\x8b", "gzip stream"), (b"\x1f\x9d", "compress stream"), (b"\xfd7zXZ\x00", "xz stream"),
+               (b"7z\xbc\xaf\x27\x1c", "7z archive"), (b"\x28\xb5\x2f\xfd", "zstd stream"),
+               (b"\x04\x22\x4d\x18", "lz4 stream"), (b"LZIP", "lzip stream"), (b"Rar!\x1a\x07", "rar archive"))
+_BZIP2 = re.compile(rb"^BZh[1-9]1AY&SY")
+_WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")
+_PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
+
+
+def _wide_text(head: bytes) -> bool:
+    """ASCII text in UTF-16 or UTF-32 without a byte order mark: one byte
+    lane of every 2 (or 4) is printable, all the other lanes are NUL."""
+    for width in (2, 4):
+        n = min(len(head), 4096) // width
+        if n < 8:
+            continue
+        lanes = [head[i:n * width:width] for i in range(width)]
+        nul = [lane.count(0) / n for lane in lanes]
+        text = [i for i in range(width)
+                if nul[i] <= 0.05 and sum(b in _PRINTABLE for b in lanes[i]) >= 0.7 * n]
+        if len(text) == 1 and all(nul[i] >= 0.6 for i in range(width) if i != text[0]):
+            return True
+    return False
+
+
+def unreadable(blob: Blob) -> str | None:
+    """Why gitleaks cannot read a blob's content, or None if it can."""
+    if blob.head.startswith(_WIDE_BOMS) or (blob.nul and _wide_text(blob.head)):
+        return "UTF-16 or UTF-32 text"
+    for magic, what in _COMPRESSED:
+        if blob.head.startswith(magic):
+            return what
+    return "bzip2 stream" if _BZIP2.match(blob.head) else None
+
+
+def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: dict, expected_commits: int,
+                   min_severity: str) -> dict:
+    """Pure: findings, canaries, commit count and problems from a gitleaks
+    run. layout is what the gate gave gitleaks: dir (its own directory),
+    snapshot and copy (its two commits), files (the head paths, by the index
+    n of their copy dir/h/<n>) and changes ([commit, path] by the index of
+    dir/c/<n>). The canaries are dir/h/<len(files)> in the snapshot and
+    dir/c/<len(changes)> in the copy."""
+    problems: list[tuple[str, str]] = []
+    markers = [m for m in ("ERR", "FTL") if re.search(rf"(?m)(?:^|\s){m}\s", stderr)]
+    if markers:
+        problems.append(("tool_error", "gitleaks logged " + " and ".join(markers)
+                         + ": a failing git call still prints \"no leaks found\" and exits 0"))
+    found = _GITLEAKS_COMMITS.findall(stderr)
+    commits = int(found[-1]) if found else None
+    data = None
+    if report is not None:
+        try:
+            data = json.loads(report.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            data = None
+    if not isinstance(data, list) or not all(isinstance(f, dict) for f in data):
+        problems.append(("tool_error", "gitleaks wrote no readable report"))
+        data = []
+    own, snapshot, copy = layout["dir"] + "/", layout["snapshot"], layout["copy"]
+    files, changes = layout["files"], layout["changes"]
+    items, seen, below = [], set(), 0
+    hits = {"head": False, "changes": False}
+    merged: dict[tuple, set[int]] = {}   # a line of a merge commit -> the parents it is added against
+    found_at: list[tuple] = []
+    for f in data:
+        rule, path, line, commit = f.get("RuleID"), f.get("File"), f.get("StartLine"), f.get("Commit")
+        if not (isinstance(rule, str) and isinstance(path, str) and isinstance(commit, str)):
+            problems.append(("tool_error", "gitleaks reported a finding without rule, file or commit"))
+            continue
+        line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
+        if path.startswith(own):
+            area, _, index = path[len(own):].partition("/")
+            n = int(index) if index.isdigit() and str(int(index)) == index else -1
+            if area == "h" and commit == snapshot and 0 <= n <= len(files):
+                if n == len(files):
+                    hits["head"] = hits["head"] or rule == GITLEAKS_CANARY_RULE
+                    continue
+                path, where = files[n], "head"
+            elif area == "c" and commit == copy and 0 <= n <= len(changes):
+                if n == len(changes):
+                    hits["changes"] = hits["changes"] or rule == GITLEAKS_CANARY_RULE
+                    continue
+                where, path = changes[n][0], changes[n][1]
+                if len(changes[n]) == 4:   # [commit, path, parent, parents] of a merge commit
+                    key = (rule, path, line, where, changes[n][3])
+                    merged.setdefault(key, set()).add(changes[n][2])
+                    continue
+            else:
+                problems.append(("tool_error", "gitleaks reported a file in the gate's own directory that it did not write"))
+                continue
+        elif commit == copy:
+            problems.append(("tool_error", "gitleaks reported a file that is not in the gate's copy of the changes"))
+            continue
+        else:
+            where = "head" if commit == snapshot else commit
+        found_at.append((rule, path, line, where))
+    # A line of a merge commit is its own content only if it is added
+    # against every parent; otherwise it came from one of them.
+    found_at += [key[:4] for key, parents in merged.items() if len(parents) == key[4]]
+    for rule, path, line, where in found_at:
+        # The real path and the copy report the same finding: keep one.
+        item = {"rule": rule, "path": path, "line": line, "severity": GITLEAKS_SEVERITY,
+                "fingerprint": sha256_hex(canonical(["gitleaks", rule, path, line, where]))}
+        if item["fingerprint"] in seen:
+            continue
+        seen.add(item["fingerprint"])
+        if RANK[item["severity"]] >= RANK[min_severity]:
+            items.append(item)
+        else:
+            below += 1
+    if code == 0 and data:
+        problems.append(("tool_error", "gitleaks exited 0 yet reported findings"))
+    if code == 1 and not data:
+        problems.append(("tool_error", "gitleaks exited 1 yet reported no finding"))
+    if commits is None:
+        problems.append(("tool_error", "gitleaks did not report how many commits it scanned"))
+    elif commits == 0:
+        problems.append(("zero_scanned", "gitleaks scanned 0 commits"))
+    elif commits != expected_commits:
+        problems.append(("coverage_gap", (f"gitleaks scanned {commits} commit(s) with added lines, expected "
+                                          f"{expected_commits}: {expected_commits - 2} of the pull request, the "
+                                          f"snapshot of its head tree and the copy of its changes")))
+    # A canary counts only as a finding that fails under the policy, like the
+    # canaries of osv-scanner: a threshold above every gitleaks finding would
+    # turn gitleaks off while the canaries still looked found.
+    failing = RANK[GITLEAKS_SEVERITY] >= RANK[min_severity]
+    canaries = [{"id": "gitleaks-builtin", "expected_rule": GITLEAKS_CANARY_RULE, "found": hits["head"] and failing},
+                {"id": "gitleaks-changes", "expected_rule": GITLEAKS_CANARY_RULE, "found": hits["changes"] and failing}]
+    missed = [c["id"] for c in canaries if not c["found"]]
+    if missed and not failing and any(hits.values()):
+        problems.append(("canary_missed", (f"gitleaks reported its canaries, but every gitleaks finding is "
+                                           f"{GITLEAKS_SEVERITY}, below min_severity {min_severity} of lock.json, so "
+                                           f"no secret could fail the gate")))
+    elif missed:
+        problems.append(("canary_missed", f"gitleaks did not report the {GITLEAKS_CANARY_RULE} canary of the gate: "
+                                          + ", ".join(missed)))
+    return {"items": items, "below": below, "canaries": canaries, "markers": markers, "commits": commits,
+            "problems": problems}
+
+
+def gitleaks_readable(s: Scan, files: list[Entry], changes: list[Change]) -> tuple[list[str], list[tuple[str, str]]]:
+    """(the head paths gitleaks cannot read, problems). A file it cannot read
+    is not counted as scanned. One that a commit of the pull request adds or
+    changes is a coverage gap: its content reaches the default branch
+    unchecked. One that only the default branch has is counted, but blocks
+    no pull request."""
+    opaque = [e.path for e in files if unreadable(s.blobs[e.oid])]
+    blobs = dict(s.blobs)
+    blobs.update(s.git.blobs(sorted({c.new for c in changes} - blobs.keys())))
+    kinds = {}
+    for c in changes:
+        what = unreadable(blobs[c.new])
+        if what:
+            kinds.setdefault(c.path, what)
+    problems = []
+    if kinds:
+        shown_kinds = "; ".join(f"{shown(p)} ({kinds[p]})" for p in sorted(kinds)[:MAX_SHOWN])
+        problems.append(("coverage_gap", (f"gitleaks cannot read {len(kinds)} file(s) that the pull request adds or "
+                                          f"changes, so their content is not scanned for secrets: {shown_kinds}"
+                                          + (" ..." if len(kinds) > MAX_SHOWN else "")
+                                          + ". Keep such content as plain text, or remove the file")))
+    return opaque, problems
+
+
+def nest(git: Git, tree: str, *names: str) -> str:
+    """The tree that holds tree at the path names[0]/names[1]/..."""
+    for name in reversed(names):
+        tree = git.mktree([f"040000 tree {tree}\t{name}".encode()])
+    return tree
+
+
+def run_gitleaks(s: Scan) -> dict:
+    name = "gitleaks"
+    version, ready = prepare(s, name)
+    if ready:
+        return {"reasons": ready}
+    work = s.scratch / "gitleaks"
+    out = work / "out"
+    out.mkdir(parents=True)
+    repo = work / "history.git"
+    hist = scratch_repository(repo, s.git.objects, s.scratch / "gitleaks-git")
+    files = sorted(s.regular_files(), key=lambda e: e.path)
+    changes = s.git.pr_changes(s.head, s.base)
+    own = "security-gate-canary-" + os.urandom(16).hex()
+
+    def canary() -> str:
+        return hist.write_blob(f'token = "{github_token_canary()}"\n'.encode())
+
+    # The snapshot: a root commit whose tree is the head tree plus the gate's
+    # directory, so `git log -p` shows every file of the head as added lines,
+    # under its own path and as the copy h/<n>, next to the canary.
+    copies = hist.mktree([f"100644 blob {e.oid}\t{n}".encode() for n, e in enumerate(files)]
+                         + [f"100644 blob {canary()}\t{len(files)}".encode()])
+    root = hist.mktree(s.git.root_records(s.head) + [f"040000 tree {nest(hist, copies, 'h')}\t{own}".encode()])
+    snapshot = hist.commit_tree(root, "security-gate: snapshot of the pull request head")
+    # The copy of the changes: a commit whose diff from its parent is every
+    # change of the pull request, as c/<n>, plus the canary. gitleaks reads it
+    # in the same call; the parent itself is excluded.
+    before = hist.mktree([f"100644 blob {c.old}\t{n}".encode() for n, c in enumerate(changes) if c.old])
+    after = hist.mktree([f"100644 blob {c.new}\t{n}".encode() for n, c in enumerate(changes)]
+                        + [f"100644 blob {canary()}\t{len(changes)}".encode()])
+    parent = hist.commit_tree(nest(hist, before, own, "c"), "security-gate: the pull request before its changes")
+    copy = hist.commit_tree(nest(hist, after, own, "c"), "security-gate: the changes of the pull request", (parent,))
+    s.canary_commit = snapshot
+    expected = hist.commits_with_additions([s.head, "^" + s.base]) + 2
+    (repo / "objects" / "info" / "alternates").write_text("/sg/pr-objects\n", encoding="utf-8")
+    argv = ["git", "--no-banner", "--no-color", "--redact", "--exit-code", "1", "--ignore-gitleaks-allow",
+            "--gitleaks-ignore-path", "/tmp", "--log-level", "info", "--report-format", "json",
+            "--report-path", "out/gitleaks.json", "--log-opts", f"{snapshot} {copy} {s.head} ^{s.base} ^{parent}",
+            "history.git"]
+    run = s.docker.run(s.ref(name), argv, mounts=((repo, "/sg/history.git", True), (s.git.objects, "/sg/pr-objects", True),
+                                                   (out, "/sg/out", False)),
+                       variables={"GITLEAKS_CONFIG_TOML": GITLEAKS_CONFIG}, timeout=s.spec(name)["timeout_s"], ok=(0, 1))
+    report_file = out / "gitleaks.json"
+    report = report_file.read_bytes() if run.code is not None and report_file.is_file() else None
+    layout = {"dir": own, "snapshot": snapshot, "copy": copy, "files": [e.path for e in files],
+              "changes": [[c.commit, c.path] if c.parents == 1 else [c.commit, c.path, c.parent, c.parents]
+                          for c in changes]}
+    j = judge_gitleaks(report, run.err, run.code, layout, expected, s.spec(name)["policy"]["min_severity"])
+    opaque, problems = gitleaks_readable(s, files, changes)
+    problems = run_problem(name, run, (0, 1)) + j["problems"] + problems
+    receipt, reasons = tool_receipt(
+        s, name, version, argv, run,
+        scanned={"files": len(files) - len(opaque), "commits": j["commits"], "packages": None, "paths": [""],
+                 "paths_truncated": False, "lockfiles": [], "unreadable": len(opaque)},
+        canaries=j["canaries"], markers=j["markers"], items=j["items"], below=j["below"], problems=problems,
+        rules_loaded=None, rules_sha256=sha256_hex(GITLEAKS_CONFIG.encode()))
+    return {"receipt": receipt, "reasons": reasons}
 
 
 # ---------------------------------------------------------------------------
-# zizmor post-filter (ADR 0003, 3.5, item 5)
+# osv-scanner: lock files of the head, database downloaded apart
 # ---------------------------------------------------------------------------
 
-def _zizmor_paths(item: object) -> set[str] | None:
+# Lock file name -> (osv-scanner extractor, ecosystem). Each extractor was run
+# with osv-scanner 2.6.0 on a lock file with a known vulnerability. Its -L
+# option needs the extractor's own name: npm-shrinkwrap.json has the format of
+# package-lock.json, and "-L npm-shrinkwrap.json:..." is refused.
+LOCKFILES = {"package-lock.json": ("package-lock.json", "npm"), "npm-shrinkwrap.json": ("package-lock.json", "npm"),
+             "pnpm-lock.yaml": ("pnpm-lock.yaml", "npm"), "yarn.lock": ("yarn.lock", "npm"),
+             "bun.lock": ("bun.lock", "npm"), "uv.lock": ("uv.lock", "PyPI"), "poetry.lock": ("poetry.lock", "PyPI"),
+             "Pipfile.lock": ("Pipfile.lock", "PyPI"), "pdm.lock": ("pdm.lock", "PyPI"),
+             "pylock.toml": ("pylock.toml", "PyPI")}
+_PYLOCK_NAME = re.compile(r"^pylock\.[^/]+\.toml$")
+# requirements.txt, requirements-dev.txt, dev-requirements.txt,
+# requirements.prod.txt; and any .txt in a directory named requirements.
+_REQUIREMENTS_NAME = re.compile(r"^(?:[^/]*[-_.])?requirements(?:[-_.][^/]*)?\.txt$")
+# Dependency manifests that osv-scanner sees only through a lock file next to
+# them or in a directory above (workspaces), and the lock files of ecosystems
+# whose databases this gate does not download. Until expected.json exists,
+# each is an unexpected_manifest: the gate cannot vouch for those packages.
+_NPM_LOCK_NAMES = ", ".join(n for n, (_, eco) in LOCKFILES.items() if eco == "npm")
+_UNSCANNED_ECOSYSTEMS = {
+    "go.mod": "Go", "Cargo.lock": "crates.io", "Gemfile.lock": "RubyGems", "gems.locked": "RubyGems",
+    "composer.lock": "Packagist", "pom.xml": "Maven", "gradle.lockfile": "Maven", "buildscript-gradle.lockfile": "Maven",
+    "packages.lock.json": "NuGet", "pubspec.lock": "Pub", "mix.lock": "Hex", "Package.resolved": "SwiftURL",
+    "Podfile.lock": "CocoaPods", "renv.lock": "CRAN", "conan.lock": "ConanCenter", "stack.yaml.lock": "Hackage",
+    "cabal.project.freeze": "Hackage", "bun.lockb": "npm, binary bun.lockb", "deno.lock": "npm and JSR, deno.lock",
+}
+# Directories of installed or vendored packages: their manifests describe the
+# packages, not the repository's dependencies.
+_INSTALLED_DIRS = frozenset({"node_modules", "bower_components", "vendor", "site-packages"})
+# The canaries: one lock file per ecosystem, with a version that has a known
+# critical vulnerability with a fix (both checked against OSV). They must come
+# out of the same call as failing findings under the policy, or the result is
+# inconclusive.
+OSV_CANARIES = (
+    {"id": "osv-npm", "file": "package-lock.json", "parser": "package-lock.json", "ecosystem": "npm",
+     "name": "minimist", "version": "1.2.5", "expected_rule": "CVE-2021-44906",
+     "content": json.dumps({"name": "security-gate-canary", "version": "0.0.0", "lockfileVersion": 3,
+                            "requires": True,
+                            "packages": {"": {"name": "security-gate-canary", "version": "0.0.0",
+                                              "dependencies": {"minimist": "1.2.5"}},
+                                         "node_modules/minimist": {"version": "1.2.5"}}}, indent=2) + "\n"},
+    {"id": "osv-pypi", "file": "requirements.txt", "parser": "requirements.txt", "ecosystem": "PyPI",
+     "name": "pyyaml", "version": "5.3.1", "expected_rule": "CVE-2020-14343", "content": "pyyaml==5.3.1\n"},
+)
+_CVSS_BANDS = ((9.0, "critical"), (7.0, "high"), (4.0, "medium"), (0.1, "low"))
+_GHSA_SEVERITY = {"CRITICAL": "critical", "HIGH": "high", "MODERATE": "medium", "MEDIUM": "medium", "LOW": "low"}
+_PINNED_REQUIREMENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:\[[A-Za-z0-9._,\s-]*\])?\s*===?\s*"
+                                 r"[A-Za-z0-9][A-Za-z0-9._+!-]*\s*(?:;.*)?$")
+_REQUIREMENT_OPTIONS = ("--index-url", "-i", "--extra-index-url", "--find-links", "-f", "--trusted-host",
+                        "--prefer-binary", "--no-binary", "--only-binary", "--pre", "--require-hashes", "--no-index")
+
+
+def lockfile_kind(path: str) -> tuple[str, str] | None:
+    """(osv-scanner parser, ecosystem) for a lock file path, or None. Lock
+    files inside node_modules belong to installed packages, not to the
+    repository's own dependencies."""
+    parts = path.split("/")
+    if "node_modules" in parts[:-1]:
+        return None
+    if parts[-1] in LOCKFILES:
+        return LOCKFILES[parts[-1]]
+    if _PYLOCK_NAME.match(parts[-1]):
+        return ("pylock.toml", "PyPI")
+    if _REQUIREMENTS_NAME.match(parts[-1]) or (len(parts) > 1 and parts[-2] == "requirements"
+                                                and parts[-1].endswith(".txt")):
+        return ("requirements.txt", "PyPI")
+    return None
+
+
+def _declares(name: str, data: bytes) -> bool | None:
+    """Whether a manifest declares dependencies: True, False, or None when it
+    cannot be read (then it counts as declaring them: fail closed)."""
+    import tomllib  # Python 3.11+; imported here so that main() can refuse an older interpreter
+    try:
+        text = data.decode("utf-8-sig")
+        if name == "package.json":
+            doc = json.loads(text)
+            return any(isinstance(doc.get(k), dict) and bool(doc[k])
+                       for k in ("dependencies", "devDependencies", "optionalDependencies"))
+        if name == "pyproject.toml":
+            doc = tomllib.loads(text)
+            project, tool = doc.get("project") or {}, doc.get("tool") or {}
+            poetry = tool.get("poetry") or {}
+            groups = (poetry.get("group") or {}).values()
+            return bool(project.get("dependencies") or project.get("optional-dependencies")
+                        or {"dependencies", "optional-dependencies"} & set(project.get("dynamic") or [])
+                        or doc.get("dependency-groups") or set(poetry.get("dependencies") or {}) - {"python"}
+                        or poetry.get("dev-dependencies") or any((g or {}).get("dependencies") for g in groups)
+                        or (tool.get("pdm") or {}).get("dev-dependencies")
+                        or (tool.get("uv") or {}).get("dev-dependencies"))
+        if name in ("setup.py", "setup.cfg"):
+            return "install_requires" in text
+        if name == "go.mod":
+            return re.search(r"(?m)^\s*require\b", text) is not None
+        if name == "pom.xml":
+            return "<dependency" in text
+    except (UnicodeDecodeError, ValueError, AttributeError, TypeError):
+        return None
+    return True
+
+
+def unexpected_manifests(s: Scan) -> list[tuple[str, str]]:
+    """(path, why) for every dependency manifest of the head without a lock
+    file that osv-scanner reads, and every lock file of an ecosystem this
+    gate does not scan. A lock file counts for a manifest in its directory
+    or in any directory below it (workspaces)."""
+    locks = {"npm": set(), "PyPI": set()}
+    for e in s.entries:
+        kind = lockfile_kind(e.path)
+        if kind:
+            folder = posixpath.dirname(e.path)
+            locks[kind[1]].add(folder)
+            if posixpath.basename(folder) == "requirements":
+                locks[kind[1]].add(posixpath.dirname(folder))
+
+    def covered(path: str, ecosystem: str) -> bool:
+        folder = posixpath.dirname(path)
+        while True:
+            if folder in locks[ecosystem]:
+                return True
+            if not folder:
+                return False
+            folder = posixpath.dirname(folder)
+
+    names = {e.path for e in s.entries}
+    out = []
+    for e in s.entries:
+        parts = e.path.split("/")
+        name = parts[-1]
+        if _INSTALLED_DIRS & set(parts[:-1]) or e.kind != "blob" or e.mode not in FILE_MODES:
+            continue
+        if name not in _UNSCANNED_ECOSYSTEMS and name not in ("package.json", "pyproject.toml", "Pipfile", "setup.py",
+                                                            "setup.cfg"):
+            continue
+        try:
+            declares = _declares(name, s.git.blob_bytes(e.oid, MAX_LOCK_BYTES))
+        except GitError:
+            declares = None
+        if declares is False:
+            continue
+        unread = " (cannot be read, so its dependencies are unknown)" if declares is None else ""
+        if name in _UNSCANNED_ECOSYSTEMS:
+            out.append((e.path, f"{_UNSCANNED_ECOSYSTEMS[name]}: an ecosystem this gate does not scan{unread}"))
+        elif name == "package.json" and not covered(e.path, "npm"):
+            out.append((e.path, f"npm dependencies without a lock file ({_NPM_LOCK_NAMES}) here or above{unread}"))
+        elif name == "Pipfile" and posixpath.join(posixpath.dirname(e.path), "Pipfile.lock") not in names:
+            out.append((e.path, f"Pipfile without Pipfile.lock next to it{unread}"))
+        elif name in ("pyproject.toml", "setup.py", "setup.cfg") and not covered(e.path, "PyPI"):
+            out.append((e.path, (f"Python dependencies without a lock file or pinned requirements file here or "
+                                 f"above{unread}")))
+    return sorted(out)
+
+
+def unpinned_requirements(text: str) -> list[str]:
+    """Lines of a requirements file whose version osv-scanner cannot know:
+    anything but name==version. Includes (-r, -c) are not followed by the
+    gate, so they count too."""
+    bad, logical = [], ""
+    for raw in text.splitlines() + [""]:
+        line = re.sub(r"(?:^|\s)#.*$", "", raw).rstrip()
+        if line.endswith("\\"):
+            logical += line[:-1] + " "
+            continue
+        logical = (logical + line).strip()
+        if logical:
+            tokens = [t for t in logical.split() if not t.startswith("--hash")]
+            text_line = " ".join(tokens)
+            if text_line.startswith("-"):
+                option = text_line.split("=", 1)[0].split()[0]
+                if option not in _REQUIREMENT_OPTIONS:
+                    bad.append(text_line.split()[0])
+            elif not _PINNED_REQUIREMENT.match(text_line):
+                bad.append(text_line.split()[0][:40])
+        logical = ""
+    return bad
+
+
+def cvss_band(score: object) -> str | None:
+    try:
+        value = float(str(score))
+    except ValueError:
+        return None
+    for floor, band in _CVSS_BANDS:
+        if value >= floor:
+            return band
+    return None
+
+
+def _norm(name: object, ecosystem: str) -> str:
+    text = str(name or "").lower()
+    return re.sub(r"[-_.]+", "-", text) if ecosystem == "PyPI" else text
+
+
+def _has_fix(records: list[dict], name: str, ecosystem: str) -> bool:
+    """A fixed version is published for this package. Without affected data
+    for the package the answer is yes: the gate fails closed."""
+    seen = False
+    for record in records:
+        for affected in record.get("affected") or []:
+            if not isinstance(affected, dict):
+                continue
+            pkg = affected.get("package") or {}
+            if pkg.get("ecosystem") != ecosystem or _norm(pkg.get("name"), ecosystem) != _norm(name, ecosystem):
+                continue
+            seen = True
+            for rng in affected.get("ranges") or []:
+                for event in (rng or {}).get("events") or []:
+                    if isinstance(event, dict) and event.get("fixed"):
+                        return True
+    return not seen
+
+
+def judge_osv(scan: bytes | None, code: int | None, expected: list[tuple[str, str]], policy: dict) -> dict:
+    """Pure: findings, canaries and per lock file package counts from the JSON
+    of an osv-scanner run (--all-packages). Paths are /sg/tree/<repository
+    path> and /sg/canary/<file>."""
+    problems: list[tuple[str, str]] = []
+    try:
+        doc = json.loads((scan or b"").decode("utf-8"))
+        results = doc["results"]
+        if not isinstance(results, list):
+            raise TypeError
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+        doc, results = None, []
+        problems.append(("tool_error", "osv-scanner wrote no readable JSON report"))
+    counts: dict[str, int] = {}
+    items, below, any_vuln = [], 0, False
+    canary_hits: set[str] = set()
+    for result in results:
+        try:
+            source = result["source"]["path"]
+            packages = result.get("packages") or []
+        except (KeyError, TypeError):
+            problems.append(("tool_error", "osv-scanner reported a result without a source"))
+            continue
+        if not isinstance(source, str) or not isinstance(packages, list):
+            problems.append(("tool_error", "osv-scanner reported a result of an unexpected type"))
+            continue
+        if source.startswith("/sg/tree/"):
+            rel, canary = source[len("/sg/tree/"):], None
+        elif source.startswith("/sg/canary/"):
+            rel, canary = None, source[len("/sg/canary/"):]
+        else:
+            problems.append(("tool_error", "osv-scanner reported a file outside the scanned directories"))
+            continue
+        if rel is not None:
+            counts[rel] = counts.get(rel, 0) + len(packages)
+        for p in packages:
+            pkg = (p or {}).get("package") or {}
+            name, version, eco = str(pkg.get("name", "")), str(pkg.get("version", "")), str(pkg.get("ecosystem", ""))
+            records = [v for v in (p.get("vulnerabilities") or []) if isinstance(v, dict)]
+            by_id = {v.get("id"): v for v in records}
+            for group in p.get("groups") or []:
+                ids = [str(i) for i in (group.get("ids") or [])]
+                aliases = [str(a) for a in (group.get("aliases") or [])]
+                if not ids:
+                    continue
+                any_vuln = True
+                members = [by_id[i] for i in ids if i in by_id]
+                severity = cvss_band(group.get("max_severity", "")) or max(
+                    (_GHSA_SEVERITY.get(str((m.get("database_specific") or {}).get("severity", "")).upper(), "")
+                     for m in members), key=lambda sev: RANK.get(sev, -1), default="")
+                severity = severity if severity in RANK else policy["unknown_severity"]
+                malicious = any(x.startswith("MAL-") for x in ids + aliases)
+                fixed = _has_fix(members, name, eco)
+                if malicious and policy["malicious_fails"]:
+                    severity, failing = "critical", True
+                else:
+                    failing = RANK[severity] >= RANK[policy["min_severity"]] and (fixed or not policy["require_fix"])
+                rule = next((i for i in ids if i.startswith("GHSA-")), None) or next(
+                    (a for a in aliases if a.startswith("CVE-")), None) or min(ids)
+                if canary is not None:
+                    for c in OSV_CANARIES:
+                        if (canary == c["file"] and failing and _norm(name, eco) == c["name"] and version == c["version"]
+                                and c["expected_rule"] in ids + aliases):
+                            canary_hits.add(c["id"])
+                    continue
+                if failing:
+                    items.append({"rule": rule, "path": rel, "line": None, "severity": severity,
+                                  "fingerprint": sha256_hex(canonical(["osv-scanner", rule, rel, eco, name, version]))})
+                else:
+                    below += 1
+    if doc is not None and code == 0 and any_vuln:
+        problems.append(("tool_error", "osv-scanner exited 0 yet reported vulnerabilities"))
+    if doc is not None and code == 1 and not any_vuln:
+        problems.append(("tool_error", "osv-scanner exited 1 yet reported no vulnerability"))
+    scanned = [path for path, _ in expected if counts.get(path, 0) > 0]
+    missing = [path for path, _ in expected if counts.get(path, 0) == 0]
+    if expected and not scanned:
+        problems.append(("zero_scanned", f"osv-scanner found 0 packages in all {len(expected)} lock file(s): "
+                                         + listed(missing)))
+    elif missing:
+        problems.append(("coverage_gap", f"osv-scanner found 0 packages in {len(missing)} lock file(s): "
+                                         + listed(missing)))
+    canaries = [{"id": c["id"], "expected_rule": c["expected_rule"], "found": c["id"] in canary_hits}
+                for c in OSV_CANARIES]
+    missed = [c["id"] for c in canaries if not c["found"]]
+    if missed:
+        problems.append(("canary_missed", "osv-scanner did not report the canary vulnerabilities as failing: "
+                                          + ", ".join(missed)))
+    return {"items": items, "below": below, "canaries": canaries, "counts": counts, "scanned": scanned,
+            "missing": missing, "problems": problems}
+
+
+_MODIFIED = re.compile(rb'"modified"\s*:\s*"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})')
+
+
+def inspect_database(path: Path) -> dict:
+    """sha256, number of records and the newest `modified` of an OSV export.
+    The zip entries carry no timestamps, so the age of the data is the age of
+    its newest record."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(CHUNK), b""):
+            digest.update(chunk)
+    records, newest = 0, ""
+    with zipfile.ZipFile(path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            records += 1
+            with zf.open(info) as fh:
+                m = _MODIFIED.search(fh.read(MAX_RECORD))
+            if m and m.group(1).decode() > newest:
+                newest = m.group(1).decode()
+    return {"sha256": "sha256:" + digest.hexdigest(), "records": records, "newest": newest + "Z" if newest else None}
+
+
+def check_databases(s: Scan, db_dir: Path, used: set[str]) -> tuple[list[dict], list[tuple[str, str]]]:
+    entries, problems = [], []
+    clock = datetime.datetime.now(datetime.UTC)
+    for db in s.spec("osv-scanner")["databases"]:
+        entry = {"name": db["name"], "ecosystem": db["ecosystem"], "source": db["source"], "path": db["path"],
+                 "sha256": None, "records": None, "newest_record": None, "age_s": None,
+                 "max_age_s": db["max_age_hours"] * 3600, "used": db["ecosystem"] in used}
+        path = safe_join(db_dir, db["path"])
+        try:
+            if path is None or path.is_symlink() or not path.is_file():
+                raise OSError("missing")
+            info = inspect_database(path)
+        except (OSError, zipfile.BadZipFile, ValueError):
+            problems.append(("offline_db", f"the {db['name']} database was not downloaded or cannot be read"))
+            entries.append(entry)
+            continue
+        entry.update(sha256=info["sha256"], records=info["records"], newest_record=info["newest"])
+        if info["newest"]:
+            newest = datetime.datetime.strptime(info["newest"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.UTC)
+            entry["age_s"] = max(0, int((clock - newest).total_seconds()))
+        if not info["records"] or entry["age_s"] is None:
+            problems.append(("offline_db", f"the {db['name']} database has no dated records"))
+        elif entry["used"] and entry["age_s"] > entry["max_age_s"]:
+            problems.append(("offline_db", (f"the {db['name']} database is {entry['age_s'] // 3600} h old, more "
+                                            f"than {db['max_age_hours']} h")))
+        entries.append(entry)
+    return entries, problems
+
+
+def run_osv(s: Scan) -> dict:
+    name = "osv-scanner"
+    expected, problems, excluded = [], [], []
+    for e in s.entries:
+        kind = lockfile_kind(e.path)
+        if kind is None:
+            continue
+        if e.kind != "blob" or e.mode not in FILE_MODES or safe_join(Path("/"), e.path) is None or "," in e.path:
+            excluded.append(e.path)
+        if e.kind != "blob" or e.mode not in FILE_MODES:
+            problems.append(("coverage_gap", f"lock file {shown(e.path)} is a symlink or submodule and is not scanned"))
+        elif safe_join(Path("/"), e.path) is None:
+            problems.append(("coverage_gap", f"lock file {shown(e.path)} has a control character and is not scanned"))
+        elif "," in e.path:
+            # osv-scanner splits the value of -L on commas: "a,b/x.lock" would
+            # be two paths, neither of which exists.
+            problems.append(("coverage_gap", (f"lock file {shown(e.path)} has a comma in its path, which "
+                                              f"osv-scanner cannot take, and is not scanned")))
+        else:
+            expected.append((e.path, kind, e.oid))
+    expected.sort()
+    manifests = unexpected_manifests(s)
+    # A lock file the gate cannot hand to osv-scanner is expected and missing.
+    every = sorted([p for p, _, _ in expected] + excluded)
+    coverage = {"expected_lockfiles": every, "scanned_lockfiles": [], "missing": every,
+                "unexpected_manifests": [p for p, _ in manifests], "outcome": PASS}
+    uncovered = []
+    if manifests:
+        uncovered.append(("unexpected_manifest", (f"{len(manifests)} dependency file(s) whose packages osv-scanner in "
+                                                  f"this gate does not see: "
+                                                  + "; ".join(f"{shown(p)} ({why})" for p, why in manifests[:MAX_SHOWN])
+                                                  + (" ..." if len(manifests) > MAX_SHOWN else ""))))
+    version, ready = prepare(s, name)
+    if ready:
+        coverage["outcome"] = INCONCLUSIVE if every or manifests else PASS
+        return {"reasons": ready + problems + uncovered, "coverage": coverage}
+    work = s.scratch / "osv"
+    tree, canary_dir, config, db_dir, fetch_out, out = (work / d for d in ("tree", "canary", "config", "db",
+                                                                            "fetch-out", "out"))
+    for d in (tree, canary_dir, config, db_dir, fetch_out, out):
+        d.mkdir(parents=True)
+    (config / "osv-scanner.toml").write_bytes(b"")
+    for c in OSV_CANARIES:
+        (canary_dir / c["file"]).write_text(c["content"], encoding="utf-8")
+    unpinned = []
+    for path, (parser, _), oid in expected:
+        data = s.git.blob_bytes(oid, MAX_SCANNED_FILE)
+        write_new_file(safe_join(tree, path), data)
+        if parser == "requirements.txt":
+            try:
+                bad = unpinned_requirements(data.decode("utf-8"))
+            except UnicodeDecodeError:
+                bad = ["(not UTF-8)"]
+            if bad:
+                unpinned.append(path)
+    if unpinned:
+        problems.append(("unpinned_requirements", f"{len(unpinned)} requirements file(s) list packages without an "
+                                                  f"exact version (name==version), so osv-scanner cannot know them: "
+                                                  + listed(unpinned)))
+    canary_args = [a for c in OSV_CANARIES for a in ("-L", f"{c['parser']}:canary/{c['file']}")]
+    common = ["--no-call-analysis=all", "--format", "json", "--all-packages", "--config", "config/osv-scanner.toml"]
+    variables = {"OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": "/sg/db"}
+    timeout = s.spec(name)["timeout_s"]
+    # 1. Download: network, and no pull request data mounted.
+    fetch_argv = ["scan", "source", "--offline-vulnerabilities", "--download-offline-databases", "--no-resolve",
+                  *common, "--output-file", "out/fetch.json", *canary_args]
+    fetch = s.docker.run(s.ref(name), fetch_argv, network=True, variables=variables, timeout=timeout, ok=(0, 1),
+                         mounts=((canary_dir, "/sg/canary", True), (config, "/sg/config", True),
+                                 (db_dir, "/sg/db", False), (fetch_out, "/sg/out", False)))
+    fetch_record = {"argv": fetch_argv, "network": "default", "exit_code": fetch.code if fetch.code is not None else -1,
+                    "retried": fetch.retried, "duration_s": fetch.duration}
+    used = {eco for _, (_, eco), _ in expected}
+    databases, db_problems = check_databases(s, db_dir, used)
+    if fetch.code not in (0, 1):
+        db_problems.insert(0, ("offline_db", f"the database download {fetch.detail or f'exited {fetch.code}'}"))
+    # 2. Scan: no network, everything read-only but the report directory.
+    tree_args = [a for path, (parser, _), _ in expected for a in ("-L", f"{parser}:tree/{path}")]
+    argv = ["scan", "source", "--offline", "--offline-vulnerabilities", "--no-resolve", *common,
+            "--output-file", "out/scan.json", *tree_args, *canary_args]
+    run = s.docker.run(s.ref(name), argv, variables=variables, timeout=timeout, ok=(0, 1),
+                       mounts=((tree, "/sg/tree", True), (canary_dir, "/sg/canary", True), (config, "/sg/config", True),
+                               (db_dir, "/sg/db", True), (out, "/sg/out", False)))
+    report_file = out / "scan.json"
+    report = report_file.read_bytes() if run.code is not None and report_file.is_file() else None
+    j = judge_osv(report, run.code, [(p, eco) for p, (_, eco), _ in expected], s.spec(name)["policy"])
+    problems = run_problem(name, run, (0, 1)) + db_problems + problems + j["problems"]
+    missing = sorted(j["missing"] + excluded)
+    coverage.update(scanned_lockfiles=j["scanned"], missing=missing,
+                    outcome=INCONCLUSIVE if missing or run.code not in (0, 1) or manifests else PASS)
+    paths = [p for p, _, _ in expected]
+    receipt, reasons = tool_receipt(
+        s, name, version, argv, run,
+        scanned={"files": len(expected), "commits": None, "packages": sum(j["counts"].get(p, 0) for p in paths),
+                 "paths": paths[:MAX_PATHS], "paths_truncated": len(paths) > MAX_PATHS,
+                 "lockfiles": [{"path": p, "packages": j["counts"].get(p, 0)} for p in paths], "unreadable": None},
+        canaries=j["canaries"], markers=[], items=j["items"], below=j["below"], problems=problems,
+        rules_loaded=sum(db["records"] or 0 for db in databases),
+        rules_sha256=sha256_hex(canonical([[db["name"], db["sha256"]] for db in databases])),
+        databases=databases, fetch=fetch_record)
+    return {"receipt": receipt, "reasons": reasons + uncovered, "coverage": coverage}
+
+
+# ---------------------------------------------------------------------------
+# zizmor: the workflows of the head
+# ---------------------------------------------------------------------------
+
+ZIZMOR_CANARY = "canary/.github/workflows/security-gate-canary.yml"
+ZIZMOR_CANARY_RULE = "template-injection"
+# A run step that expands an attacker-controlled issue title: zizmor reports
+# template-injection, high, on it.
+ZIZMOR_CANARY_TEXT = ("name: security-gate-canary\non: issues\npermissions: {}\njobs:\n  canary:\n"
+                      "    runs-on: ubuntu-24.04\n    steps:\n      - run: echo \"${{ github.event.issue.title }}\"\n")
+ZIZMOR_FINDING_CODES = frozenset({0, 11, 12, 13, 14})
+_ZIZMOR_SEVERITY = {"High": "high", "Medium": "medium", "Low": "low", "Informational": "info"}
+_WORKFLOW_FILE = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$")
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _zizmor_paths(item: object, root: str = "") -> set[str] | None:
     if not isinstance(item, dict) or not isinstance(item.get("locations"), list) or not item["locations"]:
         return None
     paths = set()
@@ -542,20 +1807,24 @@ def _zizmor_paths(item: object) -> set[str] | None:
             return None
         if not isinstance(path, str):
             return None
-        paths.add(path.removeprefix("./"))
+        path = path.removeprefix("./")
+        if not path.startswith(root):
+            return None
+        paths.add(path[len(root):])
     return paths
 
 
 def zizmor_post_filter(findings: list, owned: bytes | None, reference: bytes | None,
-                       confirmed: bool) -> tuple[list, list]:
+                       confirmed: bool, root: str = "") -> tuple[list, list]:
     """Remove exactly one zizmor finding: dangerous-triggers located only in
     the owned workflow, when that file is byte for byte the reference (the
     default branch version, or the template in this repository's own CI) or
     its fingerprint was confirmed by a human. Anything else is kept, so two
-    such findings, a renamed audit or a changed file stay red."""
+    such findings, a renamed audit or a changed file stay red. root is the
+    directory zizmor saw the repository under."""
     candidates = [i for i, item in enumerate(findings)
                   if isinstance(item, dict) and item.get("ident") == "dangerous-triggers"
-                  and _zizmor_paths(item) == {WORKFLOW_PATH}]
+                  and _zizmor_paths(item, root) == {WORKFLOW_PATH}]
     if len(candidates) != 1 or owned is None:
         return list(findings), []
     if reference is not None and owned == reference:
@@ -567,6 +1836,129 @@ def zizmor_post_filter(findings: list, owned: bytes | None, reference: bytes | N
     kept = [item for i, item in enumerate(findings) if i != candidates[0]]
     return kept, [{"tool": "zizmor", "rule": "dangerous-triggers", "path": WORKFLOW_PATH, "basis": basis,
                    "file_sha256": sha256_hex(owned)}]
+
+
+def _primary(item: dict) -> tuple[str | None, int | None]:
+    locations = [loc for loc in item.get("locations") or [] if isinstance(loc, dict)]
+    pick = next((loc for loc in locations if (loc.get("symbolic") or {}).get("kind") == "Primary"),
+                locations[0] if locations else None)
+    try:
+        path = pick["symbolic"]["key"]["Local"]["verbatim_path"]
+    except (KeyError, TypeError):
+        return None, None
+    try:
+        line = int(pick["concrete"]["location"]["start_point"]["row"]) + 1
+    except (KeyError, TypeError, ValueError):
+        line = None
+    return (path.removeprefix("./") if isinstance(path, str) else None), line
+
+
+def judge_zizmor(stdout: bytes, stderr: str, code: int | None, expected: list[str], owned: bytes | None,
+                 reference: bytes | None, confirmed: bool, policy: dict) -> dict:
+    """Pure: findings, canary, post-filter and coverage from a zizmor run on
+    the inputs tree/ (the head's workflows) and canary/."""
+    problems: list[tuple[str, str]] = []
+    completed = set()
+    for line in _ANSI.sub("", stderr).splitlines():
+        m = re.search(r"\bcompleted (\S.*?)\s*$", line)
+        if m:
+            completed.add(m.group(1).removeprefix("./"))
+    try:
+        findings = json.loads(stdout.decode("utf-8"))
+        if not isinstance(findings, list):
+            raise TypeError
+    except (UnicodeDecodeError, ValueError, TypeError):
+        findings = []
+        problems.append(("tool_error", "zizmor wrote no readable JSON report"))
+    def severity_of(f: dict) -> str:
+        return _ZIZMOR_SEVERITY.get(str((f.get("determinations") or {}).get("severity", "")), policy["unknown_severity"])
+
+    # The canary counts only as a finding that fails under the policy.
+    reported = [f for f in findings if isinstance(f, dict) and f.get("ident") == ZIZMOR_CANARY_RULE
+                and _primary(f)[0] == ZIZMOR_CANARY]
+    canary = any(RANK[severity_of(f)] >= RANK[policy["min_severity"]] for f in reported)
+    raw = [f for f in findings if not (isinstance(f, dict) and (_primary(f)[0] or "").startswith("canary/"))]
+    kept, removed = zizmor_post_filter(raw, owned, reference, confirmed, root="tree/")
+    items, below = [], 0
+    for f in kept:
+        path, line = _primary(f) if isinstance(f, dict) else (None, None)
+        if not path or not path.startswith("tree/") or not isinstance(f.get("ident"), str):
+            problems.append(("tool_error", "zizmor reported a finding outside the scanned workflows"))
+            continue
+        severity = severity_of(f)
+        rel = path[len("tree/"):]
+        item = {"rule": f["ident"], "path": rel, "line": line, "severity": severity,
+                "fingerprint": sha256_hex(canonical(["zizmor", f["ident"], rel, line]))}
+        if RANK[severity] >= RANK[policy["min_severity"]]:
+            items.append(item)
+        else:
+            below += 1
+    if code == 0 and findings:
+        problems.append(("tool_error", "zizmor exited 0 yet reported findings"))
+    if code in ZIZMOR_FINDING_CODES - {0} and not findings:
+        problems.append(("tool_error", f"zizmor exited {code} yet reported no finding"))
+    missing = [p for p in expected if "tree/" + p not in completed]
+    if missing:
+        problems.append(("coverage_gap", f"zizmor did not audit {len(missing)} workflow(s): " + listed(missing)))
+    if not canary and reported:
+        problems.append(("canary_missed", (f"zizmor reported its {ZIZMOR_CANARY_RULE} canary at "
+                                           f"{severity_of(reported[0])}, below min_severity {policy['min_severity']} "
+                                           f"of lock.json, so the canary could not fail the gate")))
+    elif not canary:
+        problems.append(("canary_missed", f"zizmor did not report the {ZIZMOR_CANARY_RULE} canary of the gate"))
+    return {"items": items, "below": below, "canary": canary, "removed": removed, "audited": len(completed & {
+        "tree/" + p for p in expected}), "problems": problems}
+
+
+def run_zizmor(s: Scan) -> dict:
+    name = "zizmor"
+    expected, problems = [], []
+    for e in s.entries:
+        if not _WORKFLOW_FILE.match(e.path):
+            continue
+        if e.kind != "blob" or e.mode not in FILE_MODES:
+            problems.append(("coverage_gap", f"workflow {shown(e.path)} is a symlink or submodule and is not audited"))
+        elif safe_join(Path("/"), e.path) is None:
+            problems.append(("coverage_gap", f"workflow {shown(e.path)} has a control character and is not audited"))
+        else:
+            expected.append((e.path, e.oid))
+    expected.sort()
+    version, ready = prepare(s, name)
+    if ready:
+        return {"reasons": ready + problems}
+    work = s.scratch / "zizmor"
+    tree, canary_root = work / "tree", work / "canary"
+    tree.mkdir(parents=True)
+    write_new_file(canary_root / ".github" / "workflows" / "security-gate-canary.yml", ZIZMOR_CANARY_TEXT.encode())
+    for path, oid in expected:
+        write_new_file(safe_join(tree, path), s.git.blob_bytes(oid, MAX_SCANNED_FILE))
+
+    def owned_at(commit: str) -> bytes | None:
+        entry = s.git.entry_at(commit, WORKFLOW_PATH)
+        if entry is None or entry[1] != "blob" or entry[0] not in FILE_MODES:
+            return None
+        return s.git.blob_bytes(entry[2], MAX_SCANNED_FILE)
+
+    argv = ["--offline", "--no-config", "--no-ignores", "--collect", "all", "--strict-collection", "--no-progress",
+            "--format", "json", "tree", "canary"]
+    run = s.docker.run(s.ref(name), argv, timeout=s.spec(name)["timeout_s"], ok=tuple(ZIZMOR_FINDING_CODES),
+                       mounts=((tree, "/sg/tree", True), (canary_root, "/sg/canary", True)))
+    j = judge_zizmor(run.out, run.err, run.code, [p for p, _ in expected], owned_at(s.head), owned_at(s.base),
+                     s.confirmed, s.spec(name)["policy"])
+    problems = run_problem(name, run, tuple(ZIZMOR_FINDING_CODES)) + problems + j["problems"]
+    receipt, reasons = tool_receipt(
+        s, name, version, argv, run,
+        scanned={"files": j["audited"], "commits": None, "packages": None, "paths": [".github/workflows"],
+                 "paths_truncated": False, "lockfiles": [], "unreadable": None},
+        canaries=[{"id": "zizmor-workflow", "expected_rule": ZIZMOR_CANARY_RULE, "found": j["canary"]}],
+        markers=[], items=j["items"], below=j["below"], problems=problems, rules_loaded=None,
+        rules_sha256=sha256_hex(canonical(argv)))
+    return {"receipt": receipt, "reasons": reasons, "post_filters": j["removed"]}
+
+
+# Every tool the gate runs, in order.
+TOOLS = (("gate-integrity", gate_integrity), ("gitleaks", run_gitleaks), ("osv-scanner", run_osv),
+         ("zizmor", run_zizmor))
 
 
 # ---------------------------------------------------------------------------
@@ -590,10 +1982,7 @@ def new_receipt() -> dict:
                 "runner_environment": g("RUNNER_ENVIRONMENT")},
         "subject": {"head_sha": None, "default_branch": None, "merge_base": None, "commits": None,
                     "canary_commit": None, "pr_number": None},
-        "trusted": {"gate_sha": None, "skill_version": GATE_VERSION,
-                    # No lock.json exists yet: the sha256 of empty input means
-                    # "no lock.json" (docs/contracts/gate-receipt.md, History).
-                    "lock_sha256": sha256_hex(b""), "config_source": "default",
+        "trusted": {"gate_sha": None, "skill_version": GATE_VERSION, "lock_sha256": None, "config_source": "default",
                     "head_config_fingerprint": None, "confirmed": False},
         "self_check": {"outcome": INCONCLUSIVE, "failed": []},
         "trust_checks": [{"id": "SG-TRUST-001", "outcome": INCONCLUSIVE, "paths": []}],
@@ -710,9 +2099,6 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     tr["head_config_fingerprint"] = fp
     tr["confirmed"] = confirmed
 
-    def listed(paths: list[str]) -> str:
-        return ", ".join(shown(p) for p in paths[:MAX_SHOWN]) + (" ..." if len(paths) > MAX_SHOWN else "")
-
     if changed_paths and not confirmed:
         detail = (f"{len(changed_paths)} protected path(s) differ from the default branch and the head "
                   f"fingerprint is not confirmed in {CONFIG_VARIABLE}: " + listed(changed_paths))
@@ -732,16 +2118,32 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     if sg001 == PASS:
         tr["config_source"] = "head_confirmed" if changed_paths else "default"
 
-    self_file = Path(__file__).read_bytes()
+    # The scanners' configuration: lock.json of the head once SG-TRUST-001
+    # passed (then it equals the default branch's or a human confirmed it),
+    # else the default branch's.
+    lock, lock_bytes, problem = load_lock(git, head if sg001 == PASS else gate_sha)
+    tr["lock_sha256"] = sha256_hex(lock_bytes) if lock_bytes is not None else None
+    if problem:
+        add_reason(receipt, problem[0], problem[1])
+
+    scan = Scan(git=git, entries=entries, blobs=blobs, head=head, base=gate_sha, scratch=scratch / "scan",
+                lock=lock, docker=Docker(scratch / "docker"), confirmed=confirmed,
+                self_file=Path(__file__).read_bytes())
     for name, tool in TOOLS:
         try:
-            result = tool(git, entries, blobs, self_file)
-        except GitError as exc:
-            add_reason(receipt, "tool_error", str(exc), name)
+            result = tool(scan)
+        except (GitError, OSError) as exc:
+            add_reason(receipt, "tool_error", f"{type(exc).__name__}: {exc}" if isinstance(exc, GitError)
+                       else f"{type(exc).__name__} while preparing the scan", name)
             continue
-        receipt["tools"].append(result["receipt"])
+        if "receipt" in result:
+            receipt["tools"].append(result["receipt"])
         for code, detail in result["reasons"]:
             add_reason(receipt, code, detail, name)
+        receipt["post_filters"] += result.get("post_filters", [])
+        if "coverage" in result:
+            receipt["coverage"] = result["coverage"]
+    sub["canary_commit"] = scan.canary_commit
 
 
 def finish(receipt: dict) -> None:
@@ -771,9 +2173,15 @@ def md(text: str) -> str:
     return text.replace("|", "\\|").replace("`", "'").replace("<", "&lt;")
 
 
+# What this version of the gate does not check, said in every summary.
+NOT_CHECKED = ("composite actions, dependabot.yml and anything else outside .github/workflows/ (zizmor audits "
+               "workflows only); secrets that no built-in rule of gitleaks knows")
+
+
 def report(receipt: dict) -> None:
     outcome = receipt["outcome"]
     print(f"security-gate: {outcome.upper()} (exit {receipt['exit_code']})")
+    print(f"security-gate: not checked by this version: {NOT_CHECKED}")
     for r in receipt["reasons"]:
         level = "error" if outcome != PASS else "notice"
         print(f"::{level} title=security-gate {r['code']}::" + annotate(r["detail"]))
@@ -784,12 +2192,17 @@ def report(receipt: dict) -> None:
     lines += [f"- self-check: {receipt['self_check']['outcome']}",
               f"- SG-TRUST-001: {receipt['trust_checks'][0]['outcome']}"]
     for t in receipt["tools"]:
-        lines.append(f"- {t['name']}: {t['outcome']}, {t['findings']['total']} finding(s), "
-                     f"{t['scanned']['files']} file(s) scanned")
+        scanned = t["scanned"]
+        counts = ", ".join(f"{scanned[k]} {k}" for k in ("files", "commits", "packages") if scanned[k] is not None)
+        if scanned.get("unreadable"):
+            counts += f" ({scanned['unreadable']} more file(s) it cannot read)"
+        canaries = sum(1 for c in t["canaries"] if c["found"])
+        lines.append(f"- {t['id']} {t['version']}: {t['outcome']}, {t['findings']['total']} finding(s), "
+                     f"{counts or 'nothing'} scanned, canaries {canaries}/{len(t['canaries'])}")
     if receipt["reasons"]:
         lines += ["", "| reason | tool | detail |", "|---|---|---|"]
         lines += [f"| {r['code']} | {r['tool'] or ''} | {md(r['detail'])} |" for r in receipt["reasons"]]
-    lines += ["", f"Receipt: artifact `{RECEIPT_ARTIFACT}`.", ""]
+    lines += ["", f"Not checked by this version: {NOT_CHECKED}.", "", f"Receipt: artifact `{RECEIPT_ARTIFACT}`.", ""]
     try:
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write("\n".join(lines))

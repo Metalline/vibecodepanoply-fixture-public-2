@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# managed-by: security-gate v0.1.0-p0 (owned)
+# managed-by: security-gate v0.1.0-a1 (owned)
 #
 # Steps of the security gate that only a human runs, in their own terminal and
 # with their own GitHub login. Do not hand this script to a coding agent.
@@ -160,7 +160,10 @@ cmd_confirm() {
     printf '\nPress Enter to read the full diff (control characters are escaped).'
     read -r _ || fail 1 "no answer; nothing was changed"
     if command -v less >/dev/null 2>&1; then
-      less "$tmp/patch"
+      # -F: a diff that fits on one screen is printed and less exits at once.
+      # -X: the diff stays on screen after less exits. -K: Ctrl+C leaves less.
+      printf '\n(Long diffs open in less: arrow keys scroll, q closes it.\n If q does nothing, switch the keyboard to the Latin layout.)\n'
+      less -FXK "$tmp/patch" || true
     else
       sed -n 'p' "$tmp/patch"
     fi
