@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-p0 (owned)
+# managed-by: security-gate v0.1.0-a1 (owned)
 #
 # The pull request gate. Do not edit: this file is compared with its template,
 # and a pull request that changes it is not trusted until a human confirms it.
@@ -6,7 +6,11 @@
 # pull_request_target runs this file as it is on the default branch, whatever
 # the pull request changes. The pull request is checked out as data only and
 # nothing from it is executed. The gate step gets no token and makes no API
-# calls; its exit code is the verdict: 0 pass, 1 fail, 2 inconclusive.
+# calls. It runs the scanners pinned in .security-gate/lock.json as containers
+# by digest: a container that reads pull request data has no network and a
+# read-only view of it, and the one container with network, which downloads
+# the vulnerability database, sees no pull request data. The exit code of the
+# gate step is the verdict: 0 pass, 1 fail, 2 inconclusive.
 name: security-gate
 
 on:

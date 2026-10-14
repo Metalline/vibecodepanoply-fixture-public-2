@@ -1,0 +1,68 @@
+{
+  "comment": "managed-by: security-gate v0.1.0-a1 (owned). The scanners of the pull request gate, pinned by image digest, and their thresholds. A pull request that changes this file is not trusted until a human confirms it (SG-TRUST-001). Contract: docs/contracts/lock.md.",
+  "schema": "security-gate/lock",
+  "schema_version": 1,
+  "tools": {
+    "gitleaks": {
+      "version": "8.30.1",
+      "image": "ghcr.io/gitleaks/gitleaks",
+      "digest": "sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f",
+      "platforms": {"linux/amd64": "sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb"},
+      "timeout_s": 900,
+      "policy": {"min_severity": "info"},
+      "verified": {
+        "on": "2026-10-13",
+        "release": "https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1",
+        "evidence": [
+          "Registry HTTP API, anonymous pull token: tag v8.30.1 resolves to this OCI image index, which lists linux/amd64",
+          "OCI labels of the image: version v8.30.1, revision 83d9cd684c87d95d656c1458ef04895a7f1cbd8e, the commit of tag v8.30.1; the labels are not signed",
+          "the gitleaks binary in the linux/amd64 image is not byte-identical to the one in the release archive gitleaks_8.30.1_linux_x64.tar.gz: the image is built separately",
+          "the same digest as the layer0 workflow of this repository"
+        ]
+      }
+    },
+    "osv-scanner": {
+      "version": "2.6.0",
+      "image": "ghcr.io/google/osv-scanner",
+      "digest": "sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa",
+      "platforms": {"linux/amd64": "sha256:b8cc6dc8805bb77fca4ada69c07cfef5a1e07784c22830e0bd49a440aa27d9fe"},
+      "timeout_s": 900,
+      "policy": {"min_severity": "high", "require_fix": true, "malicious_fails": true, "unknown_severity": "high"},
+      "databases": [
+        {"name": "osv-npm", "ecosystem": "npm", "source": "https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip",
+         "path": "osv-scalibr/npm/all.zip", "max_age_hours": 168},
+        {"name": "osv-pypi", "ecosystem": "PyPI", "source": "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip",
+         "path": "osv-scalibr/PyPI/all.zip", "max_age_hours": 168}
+      ],
+      "verified": {
+        "on": "2026-10-13",
+        "release": "https://github.com/google/osv-scanner/releases/tag/v2.6.0",
+        "evidence": [
+          "Registry HTTP API, anonymous pull token: tag v2.6.0 resolves to this manifest list, which lists linux/amd64",
+          "the /osv-scanner binary of the linux/amd64 image is byte-identical to the release asset osv-scanner_linux_amd64, sha256 ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108, as listed in osv-scanner_SHA256SUMS of the release",
+          "the release provenance multiple.intoto.jsonl (SLSA v0.2, slsa-github-generator generic workflow v2.1.0) names the same sha256, built from refs/tags/v2.6.0 at commit e840a6e8adb14b7777c78e26cfbf6e2abc1d1fc6; its signature was not verified",
+          "OCI labels of the image: version 2.6.0, revision e840a6e8adb14b7777c78e26cfbf6e2abc1d1fc6, the commit of tag v2.6.0",
+          "v2.7.0 was released on 2026-10-12, inside the 7-day cooldown"
+        ]
+      }
+    },
+    "zizmor": {
+      "version": "1.30.1",
+      "image": "ghcr.io/zizmorcore/zizmor",
+      "digest": "sha256:a2eb396d886c053073405c7a980f2139ba2248ec172243cfa3841e57196e8101",
+      "platforms": {"linux/amd64": "sha256:f8451d8719580a4489501768c4ea64b161dee94b049e206ba7cbe940d7f7df3d"},
+      "timeout_s": 600,
+      "policy": {"min_severity": "medium", "unknown_severity": "high"},
+      "verified": {
+        "on": "2026-10-13",
+        "release": "https://github.com/zizmorcore/zizmor/releases/tag/v1.30.1",
+        "evidence": [
+          "Registry HTTP API, anonymous pull token: tag 1.30.1 resolves to this OCI image index, which lists linux/amd64",
+          "OCI label revision 99a054ed9283c90abdd2d5b9fb5101d27dde9783, the commit of tag v1.30.1, and unsigned buildkit provenance in the index",
+          "the zizmor binary in the linux/amd64 image is not byte-identical to the one in the release archive zizmor-x86_64-unknown-linux-gnu.tar.gz: the image is built separately",
+          "the same digest as the layer0 workflow of this repository"
+        ]
+      }
+    }
+  }
+}
