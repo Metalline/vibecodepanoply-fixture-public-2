@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-a1 (owned)
+# managed-by: security-gate v0.1.0-b1 (owned)
 """security-gate: the pull request gate. Standard library only, Python 3.11+.
 
 The owned workflow .github/workflows/security-gate.yml runs this file from a
@@ -44,12 +44,16 @@ The verdict of this version:
   by digest: gitleaks on the head tree and on the commits of the pull request
   (each file also under a name of the gate's, so that no path allowlist of
   gitleaks skips it), osv-scanner on the lock files of the head, zizmor on
-  its workflows. A
+  its workflows, semgrep on every file of the head with the gate's own rules
+  (.security-gate/semgrep-rules.yml, from the same commit as lock.json),
+  which block, and the Semgrep Registry rules, downloaded on every run and
+  never stored, whose findings only signal unless lock.json says block. A
   container that reads pull request data has no network and a read-only view
-  of it; the one container with network downloads the vulnerability database
-  and sees no pull request data. No scanner reads a configuration or an ignore
-  list from the pull request. Each scanner finds a canary of the gate in the
-  same call that scans the pull request, or the result is inconclusive.
+  of it; the two containers with network download the vulnerability
+  databases and the Registry rules and see no pull request data. No scanner
+  reads a configuration or an ignore list from the pull request. Each scanner
+  finds a canary of the gate in the same call that scans the pull request, or
+  the result is inconclusive.
 
 Subcommands for human.sh:
     gate.py fingerprint --repo DIR --commit REV
@@ -60,6 +64,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import os
 import posixpath
@@ -72,24 +77,30 @@ import sys
 import tempfile
 import threading
 import time
+import tokenize
 import traceback
 import unicodedata
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GATE_VERSION = "0.1.0-a1"
+GATE_VERSION = "0.1.0-b1"
 RECEIPT_SCHEMA = "security-gate/receipt"
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
 FINGERPRINT_SCHEMA = "security-gate/fingerprint"
 FINGERPRINT_SCHEMA_VERSION = 1
 LOCK_SCHEMA = "security-gate/lock"
-LOCK_SCHEMA_VERSION = 1
+LOCK_SCHEMA_VERSION = 2
+# lock.json v1 (slice A) pins no semgrep. It is still read, so that a
+# repository on v0.1.0-a1 can take the new gate.py first and lock.json v2 in a
+# second pull request (ADR 0006): until then semgrep is tool_missing.
+LOCK_SCHEMA_VERSIONS = (1, 2)
 
 EVENT = "pull_request_target"
 WORKFLOW_PATH = ".github/workflows/security-gate.yml"
 GATE_PATH = ".security-gate/bin/gate.py"
 LOCK_PATH = ".security-gate/lock.json"
+SEMGREP_RULES_PATH = ".security-gate/semgrep-rules.yml"
 CONFIG_VARIABLE = "SECURITY_GATE_CONFIG"
 RECEIPT_ARTIFACT = "security-gate-receipt"
 
@@ -119,7 +130,7 @@ CANARY_LEN = len(CANARY_PREFIX) + 32
 # scanner), so a pull request cannot quiet a scanner with one; the file is
 # reported, because it suppresses nothing and only looks as if it did.
 SCANNER_CONFIG_NAMES = frozenset({".gitleaksignore", ".gitleaks.toml", "osv-scanner.toml", "zizmor.yml",
-                                  "zizmor.yaml"})
+                                  "zizmor.yaml", ".semgrepignore"})
 
 RULES = (
     (CANARY_RULE, "high", "drill canary in a file of the head tree"),
@@ -494,6 +505,55 @@ class Git:
             raise GitError(f"git cat-file exited {code}")
         return result
 
+    def write_blobs(self, pairs: list[tuple[str, Path]]) -> list[Path]:
+        """Write each blob to its new file through one cat-file --batch.
+        Returns the files that could not be created (an existing file of the
+        same name, which only a case-insensitive file system produces)."""
+        failed: list[Path] = []
+        if not pairs:
+            return failed
+        proc = subprocess.Popen(self.prefix + ["cat-file", "--batch"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.environ)
+
+        def feed() -> None:
+            try:
+                for oid, _ in pairs:
+                    proc.stdin.write(oid.encode() + b"\n")
+                proc.stdin.close()
+            except OSError:
+                pass
+
+        writer = threading.Thread(target=feed, daemon=True)
+        writer.start()
+        try:
+            for oid, path in pairs:
+                header = proc.stdout.readline().split()
+                if len(header) != 3 or header[0].decode() != oid or header[1] != b"blob":
+                    raise GitError("cat-file did not return the requested blob")
+                remaining = int(header[2])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+                except FileExistsError:
+                    fd = None
+                    failed.append(path)
+                with os.fdopen(fd, "wb") if fd is not None else open(os.devnull, "wb") as fh:
+                    while remaining:
+                        chunk = proc.stdout.read(min(CHUNK, remaining))
+                        if not chunk:
+                            raise GitError("cat-file output ended early")
+                        remaining -= len(chunk)
+                        fh.write(chunk)
+                if proc.stdout.read(1) != b"\n":
+                    raise GitError("cat-file output is not terminated")
+        finally:
+            proc.stdout.close()
+            code = proc.wait(timeout=600)
+            writer.join(timeout=60)
+        if code != 0:
+            raise GitError(f"git cat-file exited {code}")
+        return failed
+
 
 def scratch_repository(path: Path, objects: Path, scratch: Path) -> Git:
     """A bare repository of the gate's own: its config, attributes and refs
@@ -613,7 +673,9 @@ def parse_config(value: str | None) -> tuple[set[str], bool]:
 # lock.json: the scanners, their images and their thresholds
 # ---------------------------------------------------------------------------
 
-SCANNERS = ("gitleaks", "osv-scanner", "zizmor")
+# The scanners each version of lock.json pins.
+LOCK_TOOLS = {1: ("gitleaks", "osv-scanner", "zizmor"), 2: ("gitleaks", "osv-scanner", "semgrep", "zizmor")}
+_RULESET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
 _IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:/[a-z0-9][a-z0-9._-]*)+$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$")
@@ -621,6 +683,11 @@ _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _HTTPS_RE = re.compile(r"^https://[!-~]+$")
 _DB_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$")
 ECOSYSTEMS = ("npm", "PyPI")
+# What a finding of a Semgrep Registry rule at or above min_severity does:
+# signal (counted and listed in the receipt, never a fail; the template's
+# value) or block (a fail, like a finding of the gate's own rules). Which
+# rules are the Registry's the gate knows by the file it read them from.
+REGISTRY_POLICIES = ("signal", "block")
 
 
 class LockError(Exception):
@@ -650,11 +717,15 @@ def parse_lock(data: bytes) -> dict:
         raise LockError("lock.json is not JSON in UTF-8") from None
     _need(isinstance(doc, dict), "the document", "is not an object")
     _need(doc.get("schema") == LOCK_SCHEMA, "schema", f"is not {LOCK_SCHEMA}")
-    if doc.get("schema_version") != LOCK_SCHEMA_VERSION:
-        raise LockError(f"lock.json: schema_version is not {LOCK_SCHEMA_VERSION}", "unknown_schema_version")
+    version = doc.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version not in LOCK_SCHEMA_VERSIONS:
+        raise LockError("lock.json: schema_version is not one of " + ", ".join(map(str, LOCK_SCHEMA_VERSIONS)),
+                        "unknown_schema_version")
+    names = LOCK_TOOLS[version]
     tools = doc.get("tools")
-    _need(isinstance(tools, dict) and set(tools) == set(SCANNERS), "tools", "must name exactly " + ", ".join(SCANNERS))
-    for name in SCANNERS:
+    _need(isinstance(tools, dict) and set(tools) == set(names), "tools",
+          f"must name exactly {', '.join(names)} (schema_version {version})")
+    for name in names:
         t = tools[name]
         _need(isinstance(t, dict), name, "is not an object")
         _need(isinstance(t.get("version"), str) and bool(_VERSION_RE.match(t["version"])), name + ".version",
@@ -695,6 +766,21 @@ def parse_lock(data: bytes) -> dict:
                       "is not an integer from 1 to 8760")
             _need(sorted(db["ecosystem"] for db in dbs) == sorted(ECOSYSTEMS), name + ".databases",
                   "must list exactly one database for each of " + ", ".join(ECOSYSTEMS))
+        if name == "semgrep":
+            _need(p.get("registry") in REGISTRY_POLICIES, name + ".policy.registry",
+                  "is not one of " + ", ".join(REGISTRY_POLICIES))
+            sets = t.get("rulesets")
+            _need(isinstance(sets, list) and bool(sets), name + ".rulesets", "is not a non-empty array")
+            for i, rs in enumerate(sets):
+                where = f"{name}.rulesets[{i}]"
+                _need(isinstance(rs, dict), where, "is not an object")
+                _need(isinstance(rs.get("name"), str) and bool(_RULESET_NAME_RE.match(rs["name"])), where + ".name",
+                      "is not a name of lower case letters, digits, dots and hyphens")
+                _need(isinstance(rs.get("source"), str) and bool(_HTTPS_RE.match(rs["source"])), where + ".source",
+                      "is not an https URL")
+                _need(_is_int(rs.get("min_rules"), 1, 1000000), where + ".min_rules",
+                      "is not an integer from 1 to 1000000")
+            _need(len({rs["name"] for rs in sets}) == len(sets), name + ".rulesets", "has two rulesets of one name")
     return doc
 
 
@@ -832,6 +918,7 @@ class Scan:
     docker: Docker
     confirmed: bool
     self_file: bytes
+    config: str = ""            # the commit lock.json and the gate's rules are read from
     canary_commit: str | None = None
 
     def spec(self, name: str) -> dict:
@@ -844,9 +931,11 @@ class Scan:
         return [e for e in self.entries if e.kind == "blob" and e.mode in FILE_MODES]
 
 
-_VERSION_ARGS = {"gitleaks": ["version"], "osv-scanner": ["--version"], "zizmor": ["--version"]}
+# The semgrep image has no entry point: every command names its program.
+_VERSION_ARGS = {"gitleaks": ["version"], "osv-scanner": ["--version"], "semgrep": ["semgrep", "--version"],
+                 "zizmor": ["--version"]}
 _VERSION_OUT = {"gitleaks": re.compile(r"^v?(\S+)\s*$"), "osv-scanner": re.compile(r"(?m)^osv-scanner version: (\S+)"),
-                "zizmor": re.compile(r"(?m)^zizmor (\S+)")}
+                "semgrep": re.compile(r"^v?([0-9]\S*)\s*$"), "zizmor": re.compile(r"(?m)^zizmor (\S+)")}
 
 
 def prepare(s: Scan, name: str) -> tuple[str | None, list[tuple[str, str]]]:
@@ -869,6 +958,10 @@ def prepare(s: Scan, name: str) -> tuple[str | None, list[tuple[str, str]]]:
     return version, []
 
 
+# The fields of `scanned` that only semgrep fills in (see run_semgrep).
+NOT_SEMGREP = {"transcoded": None, "regex_only": None, "regex_only_paths": []}
+
+
 def severity_counts(items: list[dict]) -> dict[str, int]:
     counts = {sev: 0 for sev in SEVERITIES}
     for item in items:
@@ -879,15 +972,23 @@ def severity_counts(items: list[dict]) -> dict[str, int]:
 def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *, scanned: dict, canaries: list,
                  markers: list[str], items: list[dict], below: int, problems: list[tuple[str, str]],
                  rules_loaded: int | None, rules_sha256: str, databases: list | None = None,
-                 fetch: dict | None = None) -> tuple[dict, list[tuple[str, str]]]:
+                 fetch: dict | None = None, rulesets: list | None = None,
+                 listing: str | None = None, signal: list | None = None,
+                 tool_id: str | None = None) -> tuple[dict, list[tuple[str, str]]]:
     """The tool's receipt and its reasons. Findings at or above the threshold
-    are a fail; any problem without such a finding is inconclusive."""
+    are a fail; any problem without such a finding is inconclusive. listing
+    replaces the plain list of findings in the reason. signal: findings at
+    or above the threshold that do not block (semgrep's Registry rules under
+    policy registry: signal); they are no reason. tool_id: the id of a
+    second run of the same tool (semgrep with the Registry rules), else the
+    name."""
+    signal = signal or []
     reasons = []
     if items:
-        shown_items = "; ".join(f"{i['rule']} {shown(i['path'])}" + (f":{i['line']}" if i["line"] else "")
-                                for i in items[:MAX_SHOWN])
+        shown_items = listing or ("; ".join(f"{i['rule']} {shown(i['path'])}" + (f":{i['line']}" if i["line"] else "")
+                                            for i in items[:MAX_SHOWN]) + (" ..." if len(items) > MAX_SHOWN else ""))
         reasons.append(("finding", f"{len(items)} finding(s) at or above {s.spec(name)['policy']['min_severity']}: "
-                                   + shown_items + (" ..." if len(items) > MAX_SHOWN else "")))
+                                   + shown_items))
     reasons += problems
     if items:
         outcome, code = FAIL, "finding"
@@ -896,7 +997,7 @@ def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *,
     else:
         outcome, code = PASS, None
     receipt = {
-        "id": name,
+        "id": tool_id or name,
         "name": name,
         "version": version,
         "artifact": {"kind": "oci", "ref": s.spec(name)["image"], "sha256": s.spec(name)["digest"]},
@@ -910,8 +1011,10 @@ def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *,
         "stderr_markers": markers,
         "retried": run.retried,
         "findings": {"total": len(items), "by_severity": severity_counts(items), "items": items[:MAX_ITEMS],
-                     "truncated": len(items) > MAX_ITEMS, "below_threshold": below},
+                     "truncated": len(items) > MAX_ITEMS, "below_threshold": below, "signal": len(signal),
+                     "signal_items": signal[:MAX_ITEMS]},
         "databases": databases or [],
+        "rulesets": rulesets or [],
         "fetch": fetch,
         "outcome": outcome,
         "reason_code": code,
@@ -1036,14 +1139,15 @@ def gate_integrity(s: Scan) -> dict:
         "rules_loaded": len(RULES),
         "rules_sha256": sha256_hex(canonical(rules_doc)),
         "scanned": {"files": len(files), "commits": None, "packages": None, "paths": [""],
-                    "paths_truncated": False, "lockfiles": [], "unreadable": None},
+                    "paths_truncated": False, "lockfiles": [], "unreadable": None, **NOT_SEMGREP},
         "canaries": canaries,
         "exit_code": 1 if items or any(c["found"] for c in canaries) else 0,
         "stderr_markers": [],
         "retried": False,
         "findings": {"total": len(items), "by_severity": severity_counts(items), "items": items[:MAX_ITEMS],
-                     "truncated": len(items) > MAX_ITEMS, "below_threshold": 0},
+                     "truncated": len(items) > MAX_ITEMS, "below_threshold": 0, "signal": 0, "signal_items": []},
         "databases": [],
+        "rulesets": [],
         "fetch": None,
         "outcome": outcome,
         "reason_code": code,
@@ -1096,9 +1200,10 @@ _WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")
 _PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
 
 
-def _wide_text(head: bytes) -> bool:
-    """ASCII text in UTF-16 or UTF-32 without a byte order mark: one byte
-    lane of every 2 (or 4) is printable, all the other lanes are NUL."""
+def _wide_layout(head: bytes) -> tuple[int, int] | None:
+    """(width, lane) of ASCII text in UTF-16 or UTF-32 without a byte order
+    mark: one byte lane of every 2 (or 4) is printable, all the other lanes
+    are NUL."""
     for width in (2, 4):
         n = min(len(head), 4096) // width
         if n < 8:
@@ -1108,8 +1213,12 @@ def _wide_text(head: bytes) -> bool:
         text = [i for i in range(width)
                 if nul[i] <= 0.05 and sum(b in _PRINTABLE for b in lanes[i]) >= 0.7 * n]
         if len(text) == 1 and all(nul[i] >= 0.6 for i in range(width) if i != text[0]):
-            return True
-    return False
+            return width, text[0]
+    return None
+
+
+def _wide_text(head: bytes) -> bool:
+    return _wide_layout(head) is not None
 
 
 def unreadable(blob: Blob) -> str | None:
@@ -1187,6 +1296,7 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
     # A line of a merge commit is its own content only if it is added
     # against every parent; otherwise it came from one of them.
     found_at += [key[:4] for key, parents in merged.items() if len(parents) == key[4]]
+    wheres: dict[tuple, set[str]] = {}
     for rule, path, line, where in found_at:
         # The real path and the copy report the same finding: keep one.
         item = {"rule": rule, "path": path, "line": line, "severity": GITLEAKS_SEVERITY,
@@ -1196,6 +1306,7 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
         seen.add(item["fingerprint"])
         if RANK[item["severity"]] >= RANK[min_severity]:
             items.append(item)
+            wheres.setdefault((rule, path, line), set()).add(where)
         else:
             below += 1
     if code == 0 and data:
@@ -1225,7 +1336,27 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
         problems.append(("canary_missed", f"gitleaks did not report the {GITLEAKS_CANARY_RULE} canary of the gate: "
                                           + ", ".join(missed)))
     return {"items": items, "below": below, "canaries": canaries, "markers": markers, "commits": commits,
-            "problems": problems}
+            "problems": problems, "listing": gitleaks_listing(wheres)}
+
+
+def gitleaks_listing(wheres: dict[tuple, set[str]]) -> str:
+    """The findings of gitleaks for a person: one entry per place, saying
+    whether it is in the head tree, in commits of the pull request, or both.
+    A secret only in the history stays in the branch after the file is
+    fixed: that entry says so, and what to do."""
+    entries, history = [], False
+    for (rule, path, line), found in sorted(wheres.items(), key=lambda kv: (kv[0][1], kv[0][0], kv[0][2] or 0)):
+        commits = sorted(w[:12] for w in found if w != "head")
+        named = ("commit " if len(commits) == 1 else "commits ") + ", ".join(commits)
+        where = ("head tree and " + named if commits else "head tree") if "head" in found else \
+            f"only in {named}, not in the head tree"
+        history = history or "head" not in found
+        entries.append(f"{rule} {shown(path)}" + (f":{line}" if line else "") + f" ({where})")
+    text = "; ".join(entries[:MAX_SHOWN]) + (" ..." if len(entries) > MAX_SHOWN else "")
+    if history:
+        text += (". A secret in a commit of the pull request stays in the branch even after the file is fixed: "
+                 "revoke the key, because GitHub keeps pushed commits readable, then rewrite the branch without it")
+    return text
 
 
 def gitleaks_readable(s: Scan, files: list[Entry], changes: list[Change]) -> tuple[list[str], list[tuple[str, str]]]:
@@ -1312,9 +1443,9 @@ def run_gitleaks(s: Scan) -> dict:
     receipt, reasons = tool_receipt(
         s, name, version, argv, run,
         scanned={"files": len(files) - len(opaque), "commits": j["commits"], "packages": None, "paths": [""],
-                 "paths_truncated": False, "lockfiles": [], "unreadable": len(opaque)},
+                 "paths_truncated": False, "lockfiles": [], "unreadable": len(opaque), **NOT_SEMGREP},
         canaries=j["canaries"], markers=j["markers"], items=j["items"], below=j["below"], problems=problems,
-        rules_loaded=None, rules_sha256=sha256_hex(GITLEAKS_CONFIG.encode()))
+        rules_loaded=None, rules_sha256=sha256_hex(GITLEAKS_CONFIG.encode()), listing=j["listing"])
     return {"receipt": receipt, "reasons": reasons}
 
 
@@ -1772,7 +1903,8 @@ def run_osv(s: Scan) -> dict:
         s, name, version, argv, run,
         scanned={"files": len(expected), "commits": None, "packages": sum(j["counts"].get(p, 0) for p in paths),
                  "paths": paths[:MAX_PATHS], "paths_truncated": len(paths) > MAX_PATHS,
-                 "lockfiles": [{"path": p, "packages": j["counts"].get(p, 0)} for p in paths], "unreadable": None},
+                 "lockfiles": [{"path": p, "packages": j["counts"].get(p, 0)} for p in paths], "unreadable": None,
+                 **NOT_SEMGREP},
         canaries=j["canaries"], markers=[], items=j["items"], below=j["below"], problems=problems,
         rules_loaded=sum(db["records"] or 0 for db in databases),
         rules_sha256=sha256_hex(canonical([[db["name"], db["sha256"]] for db in databases])),
@@ -1949,16 +2081,701 @@ def run_zizmor(s: Scan) -> dict:
     receipt, reasons = tool_receipt(
         s, name, version, argv, run,
         scanned={"files": j["audited"], "commits": None, "packages": None, "paths": [".github/workflows"],
-                 "paths_truncated": False, "lockfiles": [], "unreadable": None},
+                 "paths_truncated": False, "lockfiles": [], "unreadable": None, **NOT_SEMGREP},
         canaries=[{"id": "zizmor-workflow", "expected_rule": ZIZMOR_CANARY_RULE, "found": j["canary"]}],
         markers=[], items=j["items"], below=j["below"], problems=problems, rules_loaded=None,
         rules_sha256=sha256_hex(canonical(argv)))
     return {"receipt": receipt, "reasons": reasons, "post_filters": j["removed"]}
 
 
+# ---------------------------------------------------------------------------
+# semgrep: the head tree, the gate's rules and the Registry rules
+# ---------------------------------------------------------------------------
+
+# Semgrep Registry rules may not be stored or redistributed (Semgrep Rules
+# License v1.0). The gate downloads them on every run, in a container of its
+# own with network and without pull request data, like the OSV databases, and
+# counts them. The scan runs without network on those files and the gate's
+# own rules (SEMGREP_RULES_PATH, MIT), read from the same commit as lock.json.
+#
+# semgrep runs twice on the same tree: with the gate's own rules alone, and
+# with the downloaded rulesets alone. Of rules with one id in one call,
+# semgrep 1.179.0 may drop all but the last on files without the text the
+# last one looks for: a downloaded rule under the id of a gate's rule, given
+# after the gate's rules, silenced that rule on the head and let its canary
+# be found (ADR 0006). In a call of its own the Registry cannot touch the gate's
+# rules. Each run has a receipt: "semgrep" (the gate's rules, which block by
+# their severity) and "semgrep-registry" (the Registry's, which only signal
+# under policy registry: signal, the template's, and block under
+# registry: block). A finding belongs to the run that reported it, not to the
+# look of its id: a Registry rule may be called sg-anything. A downloaded
+# ruleset with an id of the gate's rules, or with one id twice, is not usable
+# (offline_db), and a finding under an id that the run was not given is a
+# tool error.
+#
+# Two rules of the Registry the gate pins, with a canary each, one for
+# Python and one for JavaScript and TypeScript: if the Registry drops or
+# renames one, its canary is missed and the run is inconclusive, not a quiet
+# pass. Under registry: signal a canary of the Registry counts when semgrep
+# reports it through the Registry rule at all, like the canary of the gate's
+# warning rule; under block only as a finding that fails.
+SEMGREP_REGISTRY_CANARY_RULE = "python.lang.security.audit.subprocess-shell-true.subprocess-shell-true"
+SEMGREP_REGISTRY_JS_CANARY_RULE = "javascript.lang.security.audit.spawn-shell-true.spawn-shell-true"
+# p/default reports this rule on the owned workflow, which checks the pull
+# request out under pull_request_target, as data only. Like zizmor's
+# dangerous-triggers it is removed only there, only once, and only while the
+# file equals the default branch's or a human confirmed it (ADR 0003, 3.5,
+# item 5; ADR 0006).
+SEMGREP_PRT_RULE = "yaml.github-actions.security.pull-request-target-code-checkout.pull-request-target-code-checkout"
+_SEMGREP_SEVERITY = {"CRITICAL": "critical", "HIGH": "high", "ERROR": "high", "MEDIUM": "medium", "WARNING": "medium",
+                     "LOW": "low", "INFO": "info"}
+# semgrep lists every file it was given in paths.scanned (binary files too,
+# with --no-exclude-binary-files). Partly parsed files are scanned as well,
+# and listed once more as skipped with this reason.
+_SEMGREP_PARTIAL = "analysis_failed_parser_or_internal_error"
+_SEMGREP_PARSE_ERRORS = frozenset({"PartialParsing", "Syntax error", "Lexical error", "Other syntax error",
+                                   "AST builder error"})
+# Errors after which semgrep has no syntax tree of a file at all: only its
+# regex rules read it. PartialParsing leaves a tree of the rest of the file.
+_SEMGREP_UNPARSED = _SEMGREP_PARSE_ERRORS - {"PartialParsing"}
+_SEMGREP_RULE_COUNT = re.compile(r"\bwith ([0-9][0-9,]*) Code rules?\b")
+SEMGREP_IGNORE = ".semgrepignore"
+SEMGREP_REGISTRY_TOOL = "semgrep-registry"   # the receipt id of the run with the Registry rules
+MAX_RULESET_BYTES = 64 << 20
+MAX_SEMGREP_FILE = MAX_SCANNED_FILE   # a larger head file is not given to semgrep: a coverage gap
+# The time semgrep may spend on one rule in one file, and how many rules may
+# run out of it before semgrep gives the file up. Its defaults (5 s and 3)
+# time out on minified libraries and, under load, on ordinary large files:
+# a timeout is a coverage gap, so the check would flap (ADR 0006).
+SEMGREP_RULE_TIMEOUT_S = 30
+SEMGREP_TIMEOUT_THRESHOLD = 3
+# Code that semgrep 1.179.0 has no analyzer for, by the name of the file:
+# only its regex rules read it. Components and pages that hold JavaScript
+# (Vue, Svelte, Astro, HTML, EJS), the TypeScript of .mts and .cts, Python
+# as .pyw and notebooks, code files whose extension is not in lower case
+# (a.JS, a.PY) and scripts without an extension (#! on the first line).
+_SEMGREP_NO_ANALYZER = frozenset({".vue", ".svelte", ".astro", ".html", ".htm", ".xhtml", ".ejs", ".mts", ".cts",
+                                  ".pyw", ".ipynb"})
+_SEMGREP_LOWER_ONLY = frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".pyi"})
+_BOM_CODECS = ((b"\x00\x00\xfe\xff", "utf-32-be"), (b"\xff\xfe\x00\x00", "utf-32-le"), (b"\xfe\xff", "utf-16-be"),
+               (b"\xff\xfe", "utf-16-le"))
+_WIDE_CODECS = {(2, 0): "utf-16-le", (2, 1): "utf-16-be", (4, 0): "utf-32-le", (4, 3): "utf-32-be"}
+_PYTHON_SOURCE = (".py", ".pyw", ".pyi")
+_NON_ASCII = re.compile(r"[^\x00-\x7f]")
+
+
+def semgrep_text(data: bytes) -> bytes | None:
+    """The UTF-8 copy semgrep is given of a head file it cannot read as it
+    is, or None. semgrep 1.179.0 applies no regex rule at all to a file that
+    is not valid UTF-8, one stray byte is enough, says nothing about it and
+    lists the file as scanned (ADR 0006). Text in UTF-16 or UTF-32 (the
+    files gitleaks cannot read) is decoded; in any other file every byte that
+    is not part of valid UTF-8 becomes "?". Line numbers do not change."""
+    for bom, codec in _BOM_CODECS:
+        if data.startswith(bom):
+            return data[len(bom):].decode(codec, "replace").encode("utf-8")
+    head = data[:MAX_LINK_TARGET + 1]
+    codec = _WIDE_CODECS.get(_wide_layout(head) or (0, 0)) if b"\0" in data else None
+    if codec:
+        return data.decode(codec, "replace").encode("utf-8")
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", "surrogateescape").encode("utf-8", "replace")
+    return None
+
+
+def regex_only(path: str, head: bytes) -> bool:
+    """Whether semgrep reads a head file with its regex rules only, by its
+    name: code it has no analyzer for (_SEMGREP_NO_ANALYZER)."""
+    stem, dot, ext = posixpath.basename(path).rpartition(".")
+    if not dot or not stem:
+        return head.startswith(b"#!")
+    ext = "." + ext
+    return ext.lower() in _SEMGREP_NO_ANALYZER or (ext.lower() in _SEMGREP_LOWER_ONLY and ext != ext.lower())
+
+
+def python_encoding(path: str, data: bytes) -> str | None:
+    """The source encoding a Python file declares (PEP 263), if Python reads
+    other ASCII code from it than semgrep, which reads UTF-8: utf-7 turns
+    "+AHM-" into "s", unicode_escape turns "\\x73" into "s". None if the two
+    agree on every ASCII character, or if Python cannot run the file."""
+    stem, dot, ext = posixpath.basename(path).rpartition(".")
+    if dot and stem:
+        if ("." + ext).lower() not in _PYTHON_SOURCE:
+            return None
+    elif not re.match(rb"#![^\n]*python", data):
+        return None
+    try:
+        name, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+        if name in ("utf-8", "utf-8-sig"):
+            return None
+        python = data.decode(name)
+    except (SyntaxError, LookupError, UnicodeError, ValueError, TypeError):
+        return None   # Python refuses to run the file
+    semgrep = data.decode("utf-8", "surrogateescape")
+    return None if _NON_ASCII.sub("", python) == _NON_ASCII.sub("", semgrep) else name
+
+
+def semgrep_canaries() -> tuple[dict, ...]:
+    """The files of canary/ and the rule each must trip, made at run time so
+    that this file trips none of them. A canary counts only in the run of
+    its source: the gate's in the run of the gate's rules, the Registry's in
+    the run of the downloaded rulesets. A blocking canary counts only as a
+    finding that fails under the policy; the canary of the warning rule
+    counts when it is reported at all, since the rule never blocks. Whether
+    a canary of the Registry blocks is policy registry of lock.json. The
+    sg-supabase-secret-key canary is a Vue component: it also shows that the
+    regex rules read code semgrep has no analyzer for."""
+    public = "NEXT_" + "PUBLIC_"
+    return (
+        {"id": "semgrep-sg-public-secret", "expected_rule": "sg-public-secret", "blocking": True,
+         "file": "web/public-secret.ts", "content": f"export const key = process.env.{public}SG_CANARY_SECRET_KEY;\n"},
+        {"id": "semgrep-sg-service-role-client", "expected_rule": "sg-service-role-client", "blocking": True,
+         "file": "web/client.tsx", "content": "'use client';\nexport const key = process.env.SUPABASE_" + "SERVICE_ROLE_KEY;\n"},
+        {"id": "semgrep-sg-llm-no-output-limit", "expected_rule": "sg-llm-no-output-limit", "blocking": False,
+         "file": "web/llm.ts",
+         "content": "export const reply = (messages) => openai.chat.completions" + ".create({ model: \"m\", messages });\n"},
+        {"id": "semgrep-sg-supabase-secret-key", "expected_rule": "sg-supabase-secret-key", "blocking": True,
+         "file": "web/key.vue",
+         "content": "<script setup>\nconst key = \"sb_" + "secret_security-gate-canary\";\n</script>\n"},
+        {"id": "semgrep-registry", "expected_rule": SEMGREP_REGISTRY_CANARY_RULE, "blocking": None, "registry": True,
+         "file": "registry.py", "content": "import subprocess\n\nsubprocess.call(command, " + "shell=True)\n"},
+        {"id": "semgrep-registry-js", "expected_rule": SEMGREP_REGISTRY_JS_CANARY_RULE, "blocking": None,
+         "registry": True, "file": "registry.js",
+         "content": "const { spawn } = require(\"child_process\");\n\nspawn(command, [], { shell: " + "true });\n"},
+    )
+
+
+_RULE_ID = re.compile(r"[A-Za-z0-9._/-]+")
+# A key of a block mapping written plainly (no quotes, tag, anchor, alias,
+# merge key or flow style), and the value of an id: plain or in quotes of one
+# kind, without escapes, with a comment after it at most.
+_YAML_KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?")
+_YAML_ID = re.compile(r"(['\"]?)([A-Za-z0-9._/-]+)\1(?:[ \t]+#.*)?")
+# Line breaks of YAML other than \n and \r\n: a lone CR, NEL, LS and PS.
+_YAML_BREAKS = re.compile("\r(?!\n)|[\x85\u2028\u2029]")
+
+
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("a key occurs twice")
+    return dict(pairs)
+
+
+# The Registry's own answer nests 19 levels deep (p/default, 15.10.2026). The
+# limit is the gate's, not the json module's: how deep json.loads goes before a
+# RecursionError differs between Python versions (3.14 parses what 3.11 refuses).
+MAX_RULESET_JSON_DEPTH = 64
+
+
+def _json_too_deep(text: str, limit: int) -> bool:
+    """True when brackets outside strings nest deeper than `limit`."""
+    depth, in_string, escaped = 0, False, False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch in "]}":
+            depth -= 1
+    return False
+
+
+def ruleset_rules(data: bytes) -> tuple[int, set[str]]:
+    """(number of rules, rule ids) of a rules file: JSON {"rules": [...]} or
+    block YAML, the items of the top-level sequence `rules:`. The Registry
+    answers with either: the CDN in front of it keeps whichever format it
+    cached first. The gate has no YAML parser, so it reads only the plain
+    form in which both the Registry and the gate's rules file are written,
+    and fails closed on anything else: 0 rules, which is inconclusive.
+
+    Every rule must have exactly one id that the gate reads exactly as
+    semgrep does: in JSON a string (no key twice in any object); in YAML a
+    plain key `id` of the rule's mapping, at the indentation of its other
+    keys, whose value is plain or quoted, without escapes, and may carry a
+    comment. A rule whose keys are written in any other way (quoted, tagged,
+    anchored, aliased, merged, in flow style, indented otherwise, a folded
+    value), a second top-level key or document, or a line break YAML has and
+    this reader does not make the file count 0 rules: semgrep would read an
+    id this reader cannot see (ADR 0006)."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return 0, set()
+    if text.lstrip()[:1] == "{":
+        if _json_too_deep(text, MAX_RULESET_JSON_DEPTH):
+            return 0, set()
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_keys)
+        except (ValueError, RecursionError):
+            return 0, set()
+        rules = doc.get("rules") if isinstance(doc, dict) else None
+        ids = [r.get("id") if isinstance(r, dict) else None for r in rules] if isinstance(rules, list) else []
+        if not ids or not all(isinstance(i, str) and _RULE_ID.fullmatch(i) for i in ids):
+            return 0, set()
+        return len(ids), set(ids)
+    if _YAML_BREAKS.search(text):
+        return 0, set()
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
+    start = next((n for n, line in enumerate(lines) if line.lstrip(" ")[:1] not in ("", "#")), None)
+    if start is None or lines[start].rstrip(" ") != "rules:":
+        return 0, set()
+    indent, rules = None, []    # rules: the ids of each rule
+    for line in lines[start + 1:]:
+        stripped = line.lstrip(" ")
+        if not stripped or stripped.startswith("#"):
+            continue
+        lead = len(line) - len(stripped)
+        if indent is None:
+            indent = lead
+        if lead == indent and stripped.startswith("- "):
+            rules.append([])
+            key = stripped[2:]
+        elif lead == indent + 2 and rules and not (stripped == "-" or stripped.startswith("- ")):
+            key = stripped
+        elif lead > indent + 2 or (lead == indent + 2 and rules):
+            continue    # a value: deeper, or an item of a sequence of the rule's key
+        else:
+            return 0, set()
+        m = _YAML_KEY.fullmatch(key.rstrip(" \t"))
+        if not m:
+            return 0, set()
+        if m.group(1) == "id":
+            value = _YAML_ID.fullmatch(m.group(2) or "")
+            if not value:
+                return 0, set()
+            rules[-1].append(value.group(2))
+    if not rules or any(len(ids) != 1 for ids in rules):
+        return 0, set()
+    return len(rules), {ids[0] for ids in rules}
+
+
+def semgrep_roots(paths: list[str]) -> list[list[str]]:
+    """The head paths split into scanning roots so that no two paths of one
+    root are the same file on a case- or normalization-insensitive file
+    system (macOS): ".GitHub/x.yml" next to ".github/y.yml" goes into a
+    second root. On Linux every path lands in the first root."""
+    roots: list[tuple[dict[str, str], list[str]]] = []
+    for path in paths:
+        parts = path.split("/")
+        prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        keys = [unicodedata.normalize("NFC", prefix).casefold() for prefix in prefixes]
+        root = next((r for r in roots if all(r[0].get(k, p) == p for k, p in zip(keys, prefixes, strict=True))), None)
+        if root is None:
+            root = ({}, [])
+            roots.append(root)
+        root[0].update(zip(keys, prefixes, strict=True))
+        root[1].append(path)
+    return [members for _, members in roots] or [[]]
+
+
+def root_name(i: int) -> str:
+    return "tree" if i == 0 else f"tree-{i}"
+
+
+def semgrep_post_filter(findings: list[dict], owned: bytes | None, reference: bytes | None,
+                        confirmed: bool) -> tuple[list, list]:
+    """Remove exactly one semgrep finding ({rule, path, ...}, a head path):
+    SEMGREP_PRT_RULE in the owned workflow, when that file equals the default
+    branch's or its fingerprint was confirmed. Anything else is kept, as
+    zizmor_post_filter does: two such findings, a renamed rule or a changed
+    file stay red."""
+    candidates = [i for i, f in enumerate(findings) if f["rule"] == SEMGREP_PRT_RULE and f["path"] == WORKFLOW_PATH]
+    if len(candidates) != 1 or owned is None:
+        return list(findings), []
+    if reference is not None and owned == reference:
+        basis = "same_as_default"
+    elif confirmed:
+        basis = "confirmed_fingerprint"
+    else:
+        return list(findings), []
+    kept = [f for i, f in enumerate(findings) if i != candidates[0]]
+    return kept, [{"tool": "semgrep", "rule": SEMGREP_PRT_RULE, "path": WORKFLOW_PATH, "basis": basis,
+                   "file_sha256": sha256_hex(owned)}]
+
+
+def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: list[list[str]], rules_given: int,
+                  rule_ids: set[str], policy: dict, *, registry: bool, own_ids: frozenset[str] | set[str] = frozenset(),
+                  owned: bytes | None = None, reference: bytes | None = None, confirmed: bool = False) -> dict:
+    """Pure: findings, canaries, coverage and the rule count from one
+    semgrep run on the scanning roots tree/, tree-1/, ... (the head, see
+    semgrep_roots) and canary/. The gate runs semgrep twice: with its own
+    rules (registry False), whose findings block by their severity, and with
+    the downloaded Registry rulesets (registry True), whose findings signal
+    or block by policy registry. given: the head paths the gate wrote into
+    each root; rules_given: how many rules it passed; rule_ids: the ids of
+    those rules. A finding under another id is a tool error. own_ids, in the
+    run of the Registry: the ids of the gate's rules, which a downloaded
+    ruleset may not use. The post-filter (owned, reference, confirmed)
+    applies to the run of the Registry, whose rule it removes."""
+    problems: list[tuple[str, str]] = []
+    clash = set(own_ids) & rule_ids if registry else set()
+    if clash:
+        problems.append(("offline_db", (f"the downloaded Semgrep Registry rules have {len(clash)} rule id(s) of the "
+                                        f"gate's own rules ({', '.join(shown(x) for x in sorted(clash)[:MAX_SHOWN])}): "
+                                        f"those ids are the gate's, and a finding of the Registry under one would "
+                                        f"read as the gate's in the receipt")))
+    try:
+        doc = json.loads((report or b"").decode("utf-8"))
+        results, errors, paths = doc["results"], doc.get("errors") or [], doc.get("paths") or {}
+        if not (isinstance(results, list) and isinstance(errors, list) and isinstance(paths, dict)):
+            raise TypeError
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+        doc, results, errors, paths = None, [], [], {}
+        problems.append(("tool_error", "semgrep wrote no readable JSON report"))
+    counts = _SEMGREP_RULE_COUNT.findall(_ANSI.sub("", stderr))
+    loaded = int(counts[-1].replace(",", "")) if counts else None
+    if loaded is None:
+        problems.append(("tool_error", "semgrep did not report how many rules it loaded"))
+    elif loaded != rules_given:
+        problems.append(("coverage_gap", f"semgrep loaded {loaded} rule(s), the gate gave it {rules_given}"))
+    if doc is not None and doc.get("skipped_rules"):
+        problems.append(("coverage_gap", f"semgrep skipped {len(doc['skipped_rules'])} rule(s) it was given"))
+    roots = [root_name(i) + "/" for i in range(len(given))]
+
+    def head_path(path: str) -> str | None:
+        root = next((r for r in roots if path.startswith(r)), None)
+        return path[len(root):] if root else None
+
+    def severity_of(r: dict) -> str:
+        return _SEMGREP_SEVERITY.get(str((r.get("extra") or {}).get("severity", "")).upper(), policy["unknown_severity"])
+
+    # The canaries of this run: the gate's in the run of its rules, the
+    # Registry's in the run of the Registry.
+    canaries = [c for c in semgrep_canaries() if bool(c.get("registry")) == registry]
+    hits: dict[str, list[str]] = {c["id"]: [] for c in canaries}
+    raw, unknown = [], set()
+    for r in results:
+        try:
+            rule, path, line = r["check_id"], r["path"], r["start"]["line"]
+            if not (isinstance(rule, str) and isinstance(path, str) and isinstance(line, int)
+                    and not isinstance(line, bool)):
+                raise TypeError
+        except (KeyError, TypeError):
+            problems.append(("tool_error", "semgrep reported a finding without rule, path or line"))
+            continue
+        rel = head_path(path)
+        if rule not in rule_ids:
+            unknown.add(rule)
+        elif path.startswith("canary/"):
+            for c in canaries:
+                if path == "canary/" + c["file"] and rule == c["expected_rule"]:
+                    hits[c["id"]].append(severity_of(r))
+        elif rel is not None:
+            raw.append({"rule": rule, "path": rel, "line": line if line > 0 else None, "severity": severity_of(r)})
+        else:
+            problems.append(("tool_error", "semgrep reported a file outside the scanned directories"))
+    if unknown:
+        problems.append(("tool_error", (f"semgrep reported {len(unknown)} rule id(s) that "
+                                        + ("the downloaded rulesets do not have: " if registry
+                                           else "the gate's rules do not have: ")
+                                        + ", ".join(shown(x) for x in sorted(unknown)[:MAX_SHOWN])
+                                        + (" ..." if len(unknown) > MAX_SHOWN else ""))))
+    kept, removed = semgrep_post_filter(raw, owned, reference, confirmed) if registry else (raw, [])
+    # At or above the threshold, a finding of the gate's rules fails; one of
+    # the Registry's fails only under registry: block, else it is a signal.
+    blocks = not registry or policy["registry"] == "block"
+    items, signal, seen, below = [], [], set(), 0
+    for f in kept:
+        item = dict(f, fingerprint=sha256_hex(canonical(["semgrep", f["rule"], f["path"], f["line"]])))
+        if item["fingerprint"] in seen:
+            continue
+        seen.add(item["fingerprint"])
+        if RANK[item["severity"]] < RANK[policy["min_severity"]]:
+            below += 1
+        elif blocks:
+            items.append(item)
+        else:
+            signal.append(item)
+    if doc is not None and code == 0 and results:
+        problems.append(("tool_error", "semgrep exited 0 yet reported findings"))
+    if doc is not None and code == 1 and not results:
+        problems.append(("tool_error", "semgrep exited 1 yet reported no finding"))
+
+    found = []
+    for c in canaries:
+        reported = hits[c["id"]]
+        ok = any(RANK[sev] >= RANK[policy["min_severity"]] for sev in reported) if (
+            blocks if registry else c["blocking"]) else bool(reported)
+        found.append({"id": c["id"], "expected_rule": c["expected_rule"], "found": ok})
+        if ok:
+            continue
+        if reported:
+            problems.append(("canary_missed", (f"semgrep reported its {c['expected_rule']} canary at {reported[0]}, "
+                                               f"below min_severity {policy['min_severity']} of lock.json, so the "
+                                               f"canary could not fail the gate")))
+        elif registry and rule_ids and c["expected_rule"] not in rule_ids:
+            problems.append(("canary_missed", (f"the downloaded Semgrep Registry rules have no rule "
+                                               f"{c['expected_rule']}, whose canary the gate checks: the Registry "
+                                               f"changed under the gate")))
+        else:
+            problems.append(("canary_missed", f"semgrep did not report the {c['expected_rule']} canary of the gate"))
+
+    # Coverage: semgrep lists every file it read in paths.scanned. A file the
+    # gate gave it and it did not list, skipped for any reason but a partial
+    # parse, or a per-file error such as a timeout is a gap. A file it could
+    # not parse at all is scanned by its regex rules only: unparsed.
+    scanned_raw = {p for p in paths.get("scanned") or [] if isinstance(p, str)}
+    skipped = {}
+    for sk in paths.get("skipped") or []:
+        if isinstance(sk, dict) and isinstance(sk.get("path"), str):
+            skipped.setdefault(sk["path"], str(sk.get("reason")))
+    gaps: dict[str, str] = {}
+    for root, members in zip(roots, given, strict=True):
+        for path in members:
+            if root + path not in scanned_raw:
+                gaps[path] = skipped.get(root + path, "not scanned")
+    for path, reason in skipped.items():
+        if head_path(path) is not None and reason != _SEMGREP_PARTIAL:
+            gaps.setdefault(head_path(path), reason)
+    fatal, unparsed = set(), set()
+    for e in errors:
+        if not isinstance(e, dict):
+            continue
+        etype = e.get("type")
+        etype = str(etype[0] if isinstance(etype, list) and etype else etype)
+        path = e.get("path")
+        if e.get("level") == "error":
+            fatal.add(etype)
+        elif etype in _SEMGREP_PARSE_ERRORS:
+            if etype in _SEMGREP_UNPARSED and isinstance(path, str) and head_path(path) is not None:
+                unparsed.add(head_path(path))
+        elif isinstance(path, str) and head_path(path) is not None:
+            gaps.setdefault(head_path(path), etype)
+        else:
+            fatal.add(etype)
+    if fatal:
+        problems.append(("tool_error", "semgrep reported errors: " + ", ".join(shown(x) for x in sorted(fatal))))
+    if gaps:
+        problems.append(("coverage_gap", f"semgrep did not fully scan {len(gaps)} file(s): "
+                                         + "; ".join(f"{shown(p)} ({gaps[p]})" for p in sorted(gaps)[:MAX_SHOWN])
+                                         + (" ..." if len(gaps) > MAX_SHOWN else "")))
+    total = sum(len(members) for members in given)
+    scanned = sum(1 for root, members in zip(roots, given, strict=True) for path in members
+                  if root + path in scanned_raw)
+    if total and not scanned:
+        problems.append(("zero_scanned", f"semgrep scanned 0 of the {total} file(s) it was given"))
+    return {"items": items, "signal": signal, "below": below, "canaries": found, "removed": removed, "loaded": loaded,
+            "scanned": scanned, "unparsed": sorted(unparsed - set(gaps)), "problems": problems}
+
+
+def load_semgrep_rules(s: Scan) -> tuple[bytes | None, tuple[str, str] | None]:
+    """The gate's rules, from the commit lock.json is read from."""
+    entry = s.git.entry_at(s.config, SEMGREP_RULES_PATH)
+    if entry is None:
+        return None, ("invalid_document", f"{SEMGREP_RULES_PATH} is missing, so semgrep cannot run")
+    mode, kind, oid = entry
+    if kind != "blob" or mode not in FILE_MODES:
+        return None, ("invalid_document", f"{SEMGREP_RULES_PATH} is not a regular file")
+    try:
+        data = s.git.blob_bytes(oid, MAX_LOCK_BYTES)
+    except GitError as exc:
+        return None, ("invalid_document", f"{SEMGREP_RULES_PATH}: {exc}")
+    if not ruleset_rules(data)[0]:
+        return None, ("invalid_document", f"{SEMGREP_RULES_PATH} has no rules list")
+    return data, None
+
+
+def run_semgrep(s: Scan) -> dict:
+    name = "semgrep"
+    if s.lock is not None and name not in s.lock["tools"]:
+        return {"reasons": [("tool_missing", (f"semgrep did not run: {LOCK_PATH} has schema_version "
+                                              f"{s.lock['schema_version']}, which pins no semgrep; update it to "
+                                              f"schema_version {LOCK_SCHEMA_VERSION}"))]}
+    own = None
+    if s.lock is not None:
+        own, problem = load_semgrep_rules(s)
+        if problem:
+            return {"reasons": [problem, ("tool_missing", f"semgrep did not run: {problem[1]}")]}
+    version, ready = prepare(s, name)
+    if ready:
+        return {"reasons": ready}
+    spec = s.spec(name)
+    timeout = spec["timeout_s"]
+    work = s.scratch / "semgrep"
+    tree, canary_root, rules_dir, registry = (work / d for d in ("tree", "canary", "rules", "registry"))
+    for d in (tree, canary_root, rules_dir, registry):
+        d.mkdir(parents=True)
+    # The head tree, every regular file but .semgrepignore files (reported by
+    # gate-integrity), written from git objects. An empty .semgrepignore of
+    # the gate's at each scanning root: without one semgrep skips tests/,
+    # build/, dist/, vendor/, node_modules/ and more without a word.
+    problems, files = [], {}
+    for e in sorted(s.regular_files(), key=lambda e: e.path):
+        if posixpath.basename(e.path).lower() == SEMGREP_IGNORE:
+            continue
+        if safe_join(tree, e.path) is None:
+            problems.append(("coverage_gap", (f"{shown(e.path)} has a control character in its path and is not "
+                                              f"scanned by semgrep")))
+        elif s.blobs[e.oid].size > MAX_SEMGREP_FILE:
+            problems.append(("coverage_gap", (f"{shown(e.path)} is larger than {MAX_SEMGREP_FILE} bytes and is not "
+                                              f"scanned by semgrep")))
+        else:
+            files[e.path] = e.oid
+    given = semgrep_roots(sorted(files))
+    pairs, heads, root_dirs = [], [], []
+    for i, members in enumerate(given):
+        root = tree if i == 0 else work / root_name(i)
+        root.mkdir(exist_ok=True)
+        root_dirs.append(root)
+        write_new_file(root / SEMGREP_IGNORE, b"")
+        pairs += [(files[path], safe_join(root, path)) for path in members]
+        heads += members
+    clashed = set(s.git.write_blobs(pairs))
+    for target in clashed:
+        root = next(r for r in root_dirs if target.is_relative_to(r))
+        path = target.relative_to(root).as_posix()
+        given[root_dirs.index(root)].remove(path)
+        problems.append(("coverage_gap", (f"{shown(path)} clashes with another path on this file system and is not "
+                                          f"scanned by semgrep")))
+    # What semgrep cannot read as it is: a UTF-8 copy in place of the file
+    # (semgrep_text), and Python whose declared encoding semgrep does not
+    # read (a gap). Code it has no analyzer for is listed in the receipt.
+    transcoded, by_name, encodings = 0, set(), {}
+    for (oid, target), path in zip(pairs, heads, strict=True):
+        if target in clashed:
+            continue
+        if regex_only(path, s.blobs[oid].head):
+            by_name.add(path)
+        data = target.read_bytes()
+        encoding = python_encoding(path, data)
+        if encoding:
+            encodings[path] = encoding
+        text = semgrep_text(data)
+        if text is not None:
+            target.write_bytes(text)
+            transcoded += 1
+    if encodings:
+        problems.append(("coverage_gap", (f"{len(encodings)} Python file(s) declare a source encoding in which "
+                                          f"Python reads other code than semgrep checks: "
+                                          + "; ".join(f"{shown(p)} ({encodings[p]})"
+                                                      for p in sorted(encodings)[:MAX_SHOWN])
+                                          + (" ..." if len(encodings) > MAX_SHOWN else "")
+                                          + ". Save them as UTF-8")))
+    write_new_file(canary_root / SEMGREP_IGNORE, b"")
+    for c in semgrep_canaries():
+        write_new_file(canary_root / c["file"], c["content"].encode())
+    (rules_dir / "security-gate.yml").write_bytes(own)
+    # 1. Download: network, and nothing but the output directory mounted.
+    fetch_argv = ["curl", "-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time",
+                  str(min(timeout, 600)), "--max-filesize", str(MAX_RULESET_BYTES)]
+    for rs in spec["rulesets"]:
+        fetch_argv += ["--output", f"out/{rs['name']}.yml", rs["source"]]
+    fetch = s.docker.run(s.ref(name), fetch_argv, network=True, timeout=timeout, ok=(0,),
+                         mounts=((registry, "/sg/out", False),))
+    fetch_record = {"argv": fetch_argv, "network": "default", "exit_code": fetch.code if fetch.code is not None else -1,
+                    "retried": fetch.retried, "duration_s": fetch.duration}
+    fetched = [] if fetch.code == 0 else [
+        ("offline_db", f"the Semgrep Registry download {fetch.detail or f'exited {fetch.code}'}")]
+    rulesets, configs, registry_given, registry_ids = [], [], 0, set()
+    for rs in spec["rulesets"]:
+        entry = {"name": rs["name"], "source": rs["source"], "sha256": None, "rules": None, "min_rules": rs["min_rules"]}
+        rulesets.append(entry)
+        path = registry / f"{rs['name']}.yml"
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_RULESET_BYTES:
+                raise OSError("missing")
+            data = path.read_bytes()
+        except OSError:
+            fetched.append(("offline_db", f"the {rs['name']} ruleset was not downloaded or cannot be read"))
+            continue
+        count, ids = ruleset_rules(data)
+        entry.update(sha256=sha256_hex(data), rules=count)
+        if count < rs["min_rules"]:
+            fetched.append(("offline_db", (f"the {rs['name']} ruleset has {count} rule(s), fewer than min_rules "
+                                           f"{rs['min_rules']} of lock.json")))
+        # Of rules with one id in one call, semgrep 1.179.0 may drop all but
+        # the last on files without the text the last one looks for: a rule
+        # under the id of a pinned rule could silence it on the head and
+        # still trip its canary. Ids are unique in the call of the Registry.
+        if len(ids) != count:
+            fetched.append(("offline_db", (f"the {rs['name']} ruleset has {count - len(ids)} rule(s) under an id "
+                                           f"that another of its rules has: semgrep would drop such a rule on "
+                                           f"some files without a word")))
+        if ids & registry_ids:
+            fetched.append(("offline_db", (f"the {rs['name']} ruleset has {len(ids & registry_ids)} rule id(s) of "
+                                           f"another downloaded ruleset: semgrep would drop such a rule on some "
+                                           f"files without a word")))
+        if count:
+            configs += ["--config", f"registry/{rs['name']}.yml"]
+            registry_given += count
+            registry_ids |= ids
+    # 2. Two scans, no network, everything read-only but the report
+    # directory: the gate's own rules alone, then the downloaded rulesets
+    # alone. In one call, semgrep 1.179.0 lets a rule of a later --config
+    # with the id of a gate's rule silence that rule on files without its
+    # pattern (ADR 0006): a downloaded ruleset never shares a call with the
+    # gate's rules.
+    roots = [root_name(i) for i in range(len(given))]
+    inputs = tuple((root, "/sg/" + roots[i], True) for i, root in enumerate(root_dirs)) + (
+        (canary_root, "/sg/canary", True),)
+
+    def scan(config: list[str], mount: tuple, report_dir: Path) -> tuple[list[str], Run, bytes | None]:
+        report_dir.mkdir()
+        argv = ["semgrep", "scan", *config, "--metrics=off", "--disable-version-check", "--oss-only",
+                "--no-rewrite-rule-ids", "--disable-nosem", "--no-git-ignore", "--max-target-bytes", "0",
+                "--no-exclude-binary-files", "--timeout", str(SEMGREP_RULE_TIMEOUT_S), "--timeout-threshold",
+                str(SEMGREP_TIMEOUT_THRESHOLD), "--error", "--verbose", "--json", "--output", "out/semgrep.json",
+                *roots, "canary"]
+        run = s.docker.run(s.ref(name), argv, timeout=timeout, ok=(0, 1),
+                           mounts=inputs + (mount, (report_dir, "/sg/out", False)))
+        report_file = report_dir / "semgrep.json"
+        return argv, run, report_file.read_bytes() if run.code is not None and report_file.is_file() else None
+
+    def owned_at(commit: str) -> bytes | None:
+        entry = s.git.entry_at(commit, WORKFLOW_PATH)
+        if entry is None or entry[1] != "blob" or entry[0] not in FILE_MODES:
+            return None
+        return s.git.blob_bytes(entry[2], MAX_SCANNED_FILE)
+
+    def receipt_of(tool_id: str, argv: list[str], run: Run, j: dict, extra: list, rules_sha256: str,
+                   **more) -> tuple[dict, list[tuple[str, str, str]]]:
+        limited = sorted(by_name | set(j["unparsed"]))
+        receipt, reasons = tool_receipt(
+            s, name, version, argv, run, tool_id=tool_id,
+            scanned={"files": j["scanned"], "commits": None, "packages": None, "paths": [""],
+                     "paths_truncated": False, "lockfiles": [], "unreadable": None, "transcoded": transcoded,
+                     "regex_only": len(limited), "regex_only_paths": limited[:MAX_PATHS]},
+            canaries=j["canaries"], markers=[], items=j["items"], below=j["below"], problems=extra + j["problems"],
+            rules_loaded=j["loaded"], rules_sha256=rules_sha256, signal=j["signal"], **more)
+        return receipt, [(code, detail, tool_id) for code, detail in reasons]
+
+    own_given, own_ids = ruleset_rules(own)
+    argv, run, report = scan(["--config", "rules/security-gate.yml"], (rules_dir, "/sg/rules", True), work / "out")
+    j = judge_semgrep(report, run.err, run.code, given, own_given, own_ids, spec["policy"], registry=False)
+    own_receipt, reasons = receipt_of(name, argv, run, j, run_problem(name, run, (0, 1)) + problems,
+                                      sha256_hex(canonical([["security-gate", sha256_hex(own)]])))
+    if configs:
+        argv, run, report = scan(configs, (registry, "/sg/registry", True), work / "out-registry")
+        j = judge_semgrep(report, run.err, run.code, given, registry_given, registry_ids, spec["policy"],
+                          registry=True, own_ids=own_ids, owned=owned_at(s.head), reference=owned_at(s.base),
+                          confirmed=s.confirmed)
+        extra = run_problem(name, run, (0, 1)) + problems + fetched
+    else:   # nothing usable was downloaded: the reasons are in fetched
+        argv, run = [], Run(code=None, detail="not run: no usable ruleset")
+        j = {"items": [], "signal": [], "below": 0, "removed": [], "loaded": None, "scanned": 0, "unparsed": [],
+             "problems": [], "canaries": [{"id": c["id"], "expected_rule": c["expected_rule"], "found": False}
+                                          for c in semgrep_canaries() if c.get("registry")]}
+        extra = problems + fetched
+    registry_receipt, more = receipt_of(SEMGREP_REGISTRY_TOOL, argv, run, j, extra, sha256_hex(canonical(
+        [[rs["name"], rs["sha256"]] for rs in rulesets])), fetch=fetch_record, rulesets=rulesets)
+    return {"receipts": [own_receipt, registry_receipt], "reasons": reasons + more, "post_filters": j["removed"]}
+
+
 # Every tool the gate runs, in order.
 TOOLS = (("gate-integrity", gate_integrity), ("gitleaks", run_gitleaks), ("osv-scanner", run_osv),
-         ("zizmor", run_zizmor))
+         ("zizmor", run_zizmor), ("semgrep", run_semgrep))
 
 
 # ---------------------------------------------------------------------------
@@ -2121,14 +2938,15 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     # The scanners' configuration: lock.json of the head once SG-TRUST-001
     # passed (then it equals the default branch's or a human confirmed it),
     # else the default branch's.
-    lock, lock_bytes, problem = load_lock(git, head if sg001 == PASS else gate_sha)
+    config = head if sg001 == PASS else gate_sha
+    lock, lock_bytes, problem = load_lock(git, config)
     tr["lock_sha256"] = sha256_hex(lock_bytes) if lock_bytes is not None else None
     if problem:
         add_reason(receipt, problem[0], problem[1])
 
     scan = Scan(git=git, entries=entries, blobs=blobs, head=head, base=gate_sha, scratch=scratch / "scan",
                 lock=lock, docker=Docker(scratch / "docker"), confirmed=confirmed,
-                self_file=Path(__file__).read_bytes())
+                self_file=Path(__file__).read_bytes(), config=config)
     for name, tool in TOOLS:
         try:
             result = tool(scan)
@@ -2136,10 +2954,9 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
             add_reason(receipt, "tool_error", f"{type(exc).__name__}: {exc}" if isinstance(exc, GitError)
                        else f"{type(exc).__name__} while preparing the scan", name)
             continue
-        if "receipt" in result:
-            receipt["tools"].append(result["receipt"])
-        for code, detail in result["reasons"]:
-            add_reason(receipt, code, detail, name)
+        receipt["tools"] += result.get("receipts") or ([result["receipt"]] if "receipt" in result else [])
+        for code, detail, *tool_id in result["reasons"]:
+            add_reason(receipt, code, detail, tool_id[0] if tool_id else name)
         receipt["post_filters"] += result.get("post_filters", [])
         if "coverage" in result:
             receipt["coverage"] = result["coverage"]
@@ -2169,13 +2986,24 @@ def annotate(text: str) -> str:
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+# Text of the pull request (paths, rule ids) in the job summary is plain
+# text: no link, image, autolink, HTML, emphasis or table cell of its own.
+_MD_ESCAPE = re.compile(r"([\\\[\]()*_~|])")
+
+
 def md(text: str) -> str:
-    return text.replace("|", "\\|").replace("`", "'").replace("<", "&lt;")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "'")
+    return _MD_ESCAPE.sub(r"\\\1", text)
 
 
 # What this version of the gate does not check, said in every summary.
 NOT_CHECKED = ("composite actions, dependabot.yml and anything else outside .github/workflows/ (zizmor audits "
-               "workflows only); secrets that no built-in rule of gitleaks knows")
+               "workflows only); secrets that no built-in rule of gitleaks knows; code only through the gate's own "
+               "Semgrep rules and the Semgrep Registry rules of lock.json, whose findings only signal and never fail "
+               "the gate unless lock.json sets them to block, and only through their regex rules where semgrep has "
+               "no analyzer for the code (Vue, Svelte, Astro and HTML components, .mts, .cts, scripts without an "
+               "extension, notebooks) or cannot parse it; row level security of Supabase migrations and Firebase "
+               "rules; new packages (whether they exist and how old they are)")
 
 
 def report(receipt: dict) -> None:
@@ -2196,9 +3024,27 @@ def report(receipt: dict) -> None:
         counts = ", ".join(f"{scanned[k]} {k}" for k in ("files", "commits", "packages") if scanned[k] is not None)
         if scanned.get("unreadable"):
             counts += f" ({scanned['unreadable']} more file(s) it cannot read)"
+        notes = []
+        if scanned.get("transcoded"):
+            notes.append(f"{scanned['transcoded']} of the files as a UTF-8 copy")
+        if scanned.get("regex_only"):
+            more = scanned["regex_only"] - min(5, len(scanned["regex_only_paths"]))
+            notes.append(f"{scanned['regex_only']} only with regex rules: "
+                         + ", ".join(md(shown(p)) for p in scanned["regex_only_paths"][:5])
+                         + (f" and {more} more" if more else ""))
         canaries = sum(1 for c in t["canaries"] if c["found"])
-        lines.append(f"- {t['id']} {t['version']}: {t['outcome']}, {t['findings']['total']} finding(s), "
-                     f"{counts or 'nothing'} scanned, canaries {canaries}/{len(t['canaries'])}")
+        below = t["findings"]["below_threshold"]
+        lines.append(f"- {t['id']} {t['version']}: {t['outcome']}, {t['findings']['total']} finding(s)"
+                     + (f" and {below} below the threshold (not blocking)" if below else "")
+                     + f", {counts or 'nothing'} scanned" + (f" ({'; '.join(notes)})" if notes else "")
+                     + f", canaries {canaries}/{len(t['canaries'])}")
+        signal = t["findings"]["signal_items"]
+        if t["findings"]["signal"]:
+            more = t["findings"]["signal"] - min(5, len(signal))
+            lines.append(f"  - {t['findings']['signal']} registry finding(s), signal only: "
+                         + "; ".join(md(f"{shown(i['rule'])} {shown(i['path'])}" + (f":{i['line']}" if i["line"] else ""))
+                                     for i in signal[:5])
+                         + (f" and {more} more (receipt)" if more else ""))
     if receipt["reasons"]:
         lines += ["", "| reason | tool | detail |", "|---|---|---|"]
         lines += [f"| {r['code']} | {r['tool'] or ''} | {md(r['detail'])} |" for r in receipt["reasons"]]
