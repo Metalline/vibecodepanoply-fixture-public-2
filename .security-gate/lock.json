@@ -1,7 +1,7 @@
 {
-  "comment": "managed-by: security-gate v0.1.0-b1 (owned). The scanners of the pull request gate, pinned by image digest, and their thresholds. A pull request that changes this file is not trusted until a human confirms it (SG-TRUST-001). Contract: docs/contracts/lock.md.",
+  "comment": "managed-by: security-gate v0.1.0-a1 (owned). The scanners of the pull request gate, pinned by image digest, and their thresholds. A pull request that changes this file is not trusted until a human confirms it (SG-TRUST-001). Contract: docs/contracts/lock.md.",
   "schema": "security-gate/lock",
-  "schema_version": 2,
+  "schema_version": 1,
   "tools": {
     "gitleaks": {
       "version": "8.30.1",
@@ -43,29 +43,6 @@
           "the release provenance multiple.intoto.jsonl (SLSA v0.2, slsa-github-generator generic workflow v2.1.0) names the same sha256, built from refs/tags/v2.6.0 at commit e840a6e8adb14b7777c78e26cfbf6e2abc1d1fc6; its signature was not verified",
           "OCI labels of the image: version 2.6.0, revision e840a6e8adb14b7777c78e26cfbf6e2abc1d1fc6, the commit of tag v2.6.0",
           "v2.7.0 was released on 2026-10-12, inside the 7-day cooldown"
-        ]
-      }
-    },
-    "semgrep": {
-      "version": "1.179.0",
-      "image": "docker.io/semgrep/semgrep",
-      "digest": "sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b",
-      "platforms": {"linux/amd64": "sha256:cab19964e6c93019934252a9cd591d9b27df1e5b5d1734b26f4069ae51c295f8"},
-      "timeout_s": 900,
-      "policy": {"min_severity": "high", "unknown_severity": "high", "registry": "signal"},
-      "rulesets": [
-        {"name": "semgrep-default", "source": "https://semgrep.dev/c/p/default", "min_rules": 900}
-      ],
-      "verified": {
-        "on": "2026-10-14",
-        "release": "https://github.com/semgrep/semgrep/releases/tag/v1.179.0",
-        "evidence": [
-          "Registry HTTP API of Docker Hub, anonymous pull token: tag 1.179.0 resolves to this OCI image index, which lists linux/amd64 and linux/arm64 with unsigned buildkit provenance (SLSA v0.2)",
-          "the image is built from the private repository semgrep/semgrep-proprietary (OCI label and provenance: revision 8fa217f125e9c6f815a9ddea80b5b1c4a559ed10, branch release-1.179.0); it cannot be matched with the public tag v1.179.0",
-          "the image installs the wheel semgrep-1.179.0-...-musllinux_1_2_x86_64.whl: its RECORD equals that of the PyPI wheel of the same name (sha256 69bce348296374df6c51e72758801ce06dd18d6dfb307bc73d24b9de53bbe5f1) plus two files, semgrep-core-proprietary and pro-installed-by.txt; semgrep-core is byte-identical (sha256 791c2d288a935ca584d9a3509aef57b1dc37cca12940d76070ba224b6ad046ed). The gate runs it with --oss-only",
-          "the dependencies of the wheel were installed in the image at build time and were not compared",
-          "v1.180.0 was released on 2026-10-07, inside the 7-day cooldown",
-          "the ruleset is the Semgrep Registry pack p/default, 1074 rules on 2026-10-14, downloaded on every run and never stored (Semgrep Rules License v1.0)"
         ]
       }
     },
