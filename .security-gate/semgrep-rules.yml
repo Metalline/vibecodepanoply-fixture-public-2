@@ -1,0 +1,175 @@
+# managed-by: security-gate v0.1.0-b1 (owned)
+#
+# The security gate's own Semgrep rules. The gate runs them from the default
+# branch in a Semgrep call of their own, apart from the Semgrep Registry rules
+# it downloads at run time; a pull request that changes this file is not
+# trusted until a human confirms it (SG-TRUST-001). Each rule has a canary of
+# the gate that must be found in the same Semgrep call.
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the vibecodepanoply authors
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this file (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to the
+# following conditions: the above copyright notice and this permission notice
+# shall be included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Severity: ERROR fails the gate, WARNING is reported below the threshold of
+# .security-gate/lock.json and does not block.
+#
+# Of entries that share an id, semgrep 1.179.0 may drop all but the last on
+# files without the text the last one looks for (ADR 0006). The two entries
+# of an id below look for the same names (process.env and import.meta.env;
+# chat.completions.create and responses.create), and tests/semgrep_fixtures.py
+# has a case for every entry.
+rules:
+  # A variable with a public prefix is compiled into the browser or app
+  # bundle (Next.js, Vite, Expo). Its name says it is a secret: SECRET,
+  # SERVICE_ROLE, SERVICE_KEY or PRIVATE in it, or it is the key or token of
+  # an LLM or email API, which are never publishable; or its value is a
+  # secret key, a GitHub secret with such a name included. Publishable names
+  # and values (ANON_KEY, PUBLISHABLE_KEY, SITE_KEY, pk_ keys, Firebase
+  # apiKey) do not match. Regex rule: it reads code, environment and config
+  # files and workflows alike; not prose, which names such variables to warn
+  # about them.
+  - id: sg-public-secret
+    languages: [regex]
+    severity: ERROR
+    message: >-
+      A variable with a public prefix (NEXT_PUBLIC_, VITE_, EXPO_PUBLIC_) holds
+      a secret: the bundler writes its value into code that every visitor
+      downloads. Rename it without the public prefix, read it only on the
+      server, and rotate the key.
+    metadata:
+      category: security
+      cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
+    paths:
+      exclude: ["*.md", "*.mdx", "*.markdown", "*.rst", "*.adoc"]
+    pattern-either:
+      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]*(?:SECRET|SERVICE_ROLE|SERVICE_KEY|PRIVATE)[A-Z0-9_]*
+      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_(?:[A-Z0-9]+_)*(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_GENERATIVE_AI|GROQ|MISTRAL|COHERE|DEEPSEEK|OPENROUTER|PERPLEXITY|REPLICATE|TOGETHER|FIREWORKS|XAI|ELEVENLABS|HUGGINGFACE|HF|RESEND|SENDGRID|MAILGUN|POSTMARK)(?:_[A-Z0-9]+)*_(?:KEY|TOKEN)\b
+      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]+["']?\s*[:=]\s*["'`]?(?:sb_secret_|sk_live_|rk_live_|sk-(?:proj|svcacct|admin|ant|or)-)
+      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]+["']?\s*[:=]\s*["'`]?eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*(?:c2VydmljZV9yb2xl|NlcnZpY2Vfcm9sZ|zZXJ2aWNlX3JvbG)
+      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]+["']?\s*:\s*["']?\$\{\{\s*secrets[.][A-Za-z0-9_]*(?i:secret|service_role|service_key|private|openai|anthropic|claude|gemini|google_generative_ai|groq|mistral|cohere|deepseek|openrouter|perplexity|replicate|together|fireworks|xai|elevenlabs|huggingface|hf|resend|sendgrid|mailgun|postmark)
+
+  # The Supabase service_role key or a secret key (sb_secret_) bypasses row
+  # level security. In code that runs in the browser or in the app it is
+  # everyone's key.
+  - id: sg-service-role-client
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      The Supabase service_role or secret key is used in code that runs in the
+      browser or in the app, where anyone can read it and bypass row level
+      security. Use it only in server code (route handlers, server actions,
+      edge functions) and rotate the key.
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+    pattern-either:
+      # A Next.js client component reads the service key from the
+      # environment: code, not a comment or another string.
+      - patterns:
+          - pattern-inside: |
+              "use client";
+              ...
+          - pattern-either:
+              - pattern: process.env.$NAME
+              - pattern: process.env["$NAME"]
+          - metavariable-regex:
+              metavariable: $NAME
+              regex: (?i).*service_?(?:role|key)
+      # Vite compiles import.meta.env into the browser bundle.
+      - patterns:
+          - pattern: import.meta.env.$NAME
+          - metavariable-regex:
+              metavariable: $NAME
+              regex: (?i).*service_?(?:role|key)
+  # Components of Vue and Svelte and the scripts of HTML pages run in the
+  # browser too. semgrep has no JavaScript analyzer for them, so this entry
+  # reads their text ([.] is a dot); it reads no file the entry above reads.
+  - id: sg-service-role-client
+    languages: [regex]
+    severity: ERROR
+    message: >-
+      The Supabase service_role or secret key is used in a component that runs
+      in the browser, where anyone can read it and bypass row level security.
+      Use it only in server code and rotate the key.
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+    paths:
+      include: ["*.vue", "*.svelte", "*.html", "*.htm"]
+    pattern-regex: \b(?:process|import[.]meta)[.]env[.][A-Za-z0-9_]*(?i:service_?(?:role|key))
+
+  # The Supabase secret key (sb_secret_) or a service_role JWT itself,
+  # written into any file of the repository: code of any language, config,
+  # environment files and prose.
+  - id: sg-supabase-secret-key
+    languages: [regex]
+    severity: ERROR
+    message: >-
+      A Supabase secret key (sb_secret_) or service_role key is written into a
+      file of the repository. Anyone who can read the code, and every visitor
+      if the file ends up in the browser or app bundle, can bypass row level
+      security with it. Move it to the server's environment and rotate the key.
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+    pattern-either:
+      - pattern-regex: \bsb_secret_[A-Za-z0-9_-]{10,}
+      - pattern-regex: \beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*(?:c2VydmljZV9yb2xl|NlcnZpY2Vfcm9sZ|zZXJ2aWNlX3JvbG)
+
+  # An OpenAI SDK call (Chat Completions or Responses API) without an output
+  # limit. Only a warning: the limit caps the cost of one call, not the
+  # number of calls, and does not stop a stolen key (set a spending limit at
+  # the provider). Anthropic's SDK requires max_tokens and is not matched.
+  - id: sg-llm-no-output-limit
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      OpenAI SDK call without an output limit (max_completion_tokens or
+      max_tokens for Chat Completions, max_output_tokens for the Responses
+      API). Set one, and a spending limit at the provider.
+    metadata:
+      category: security
+      cwe: "CWE-770: Allocation of Resources Without Limits or Throttling"
+    pattern-either:
+      - patterns:
+          - pattern: $C.chat.completions.create({...})
+          - pattern-not: "$C.chat.completions.create({..., max_tokens: $X, ...})"
+          - pattern-not: "$C.chat.completions.create({..., max_completion_tokens: $X, ...})"
+      - patterns:
+          - pattern: $C.responses.create({...})
+          - pattern-not: "$C.responses.create({..., max_output_tokens: $X, ...})"
+  - id: sg-llm-no-output-limit
+    languages: [python]
+    severity: WARNING
+    message: >-
+      OpenAI SDK call without an output limit (max_completion_tokens or
+      max_tokens for Chat Completions, max_output_tokens for the Responses
+      API). Set one, and a spending limit at the provider.
+    metadata:
+      category: security
+      cwe: "CWE-770: Allocation of Resources Without Limits or Throttling"
+    pattern-either:
+      - patterns:
+          - pattern: $C.chat.completions.create(...)
+          - pattern-not: $C.chat.completions.create(..., max_tokens=$X, ...)
+          - pattern-not: $C.chat.completions.create(..., max_completion_tokens=$X, ...)
+          - pattern-not: $C.chat.completions.create(..., **$KW)
+      - patterns:
+          - pattern: $C.responses.create(...)
+          - pattern-not: $C.responses.create(..., max_output_tokens=$X, ...)
+          - pattern-not: $C.responses.create(..., **$KW)
