@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b1 (owned)
+# managed-by: security-gate v0.1.0-b2 (owned)
 """security-gate: the pull request gate. Standard library only, Python 3.11+.
 
 The owned workflow .github/workflows/security-gate.yml runs this file from a
@@ -40,7 +40,10 @@ The verdict of this version:
   files, which the scanners below never read. Two canaries planted by the gate
   itself prove that the rules saw the tree;
 - the scanners pinned in .security-gate/lock.json (taken from the default
-  branch, or from the head once SG-TRUST-001 passed), each run as a container
+  branch, or from the head once SG-TRUST-001 passed; from the default branch
+  again when a confirmed new gate.py that declares a lock.json schema this
+  version does not read brings a lock.json of it, see run_pr), each run as a
+  container
   by digest: gitleaks on the head tree and on the commits of the pull request
   (each file also under a name of the gate's, so that no path allowlist of
   gitleaks skips it), osv-scanner on the lock files of the head, zizmor on
@@ -62,6 +65,7 @@ Subcommands for human.sh:
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
 import hashlib
 import io
@@ -81,19 +85,25 @@ import tokenize
 import traceback
 import unicodedata
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GATE_VERSION = "0.1.0-b1"
+GATE_VERSION = "0.1.0-b2"
 RECEIPT_SCHEMA = "security-gate/receipt"
-RECEIPT_SCHEMA_VERSION = 3
+RECEIPT_SCHEMA_VERSION = 4
 FINGERPRINT_SCHEMA = "security-gate/fingerprint"
 FINGERPRINT_SCHEMA_VERSION = 1
 LOCK_SCHEMA = "security-gate/lock"
 LOCK_SCHEMA_VERSION = 2
 # lock.json v1 (slice A) pins no semgrep. It is still read, so that a
 # repository on v0.1.0-a1 can take the new gate.py first and lock.json v2 in a
-# second pull request (ADR 0006): until then semgrep is tool_missing.
+# second pull request (ADR 0006): until then semgrep is tool_missing. A
+# version above these, in a confirmed pull request whose gate.py declares it,
+# is judged with the default branch's scanners (lock_schema_ahead, run_pr).
+# The gate of the default branch reads the next line in the gate.py of the
+# pull request that upgrades it, as data (lock_schemas_declared): keep it one
+# line, written exactly so.
 LOCK_SCHEMA_VERSIONS = (1, 2)
 
 EVENT = "pull_request_target"
@@ -155,6 +165,7 @@ MAX_PATHS = 50
 CHUNK = 1 << 20
 MAX_LINK_TARGET = 4096
 MAX_LOCK_BYTES = 1 << 20
+MAX_GATE_BYTES = 1 << 20
 MAX_SCANNED_FILE = 128 << 20
 MAX_RECORD = 4 << 20
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -803,6 +814,63 @@ def load_lock(git: Git, commit: str) -> tuple[dict | None, bytes | None, tuple[s
         return None, data, (exc.code, str(exc))
 
 
+def lock_schema_ahead(data: bytes | None) -> int | None:
+    """The schema_version of a lock.json that is newer than every version this
+    gate reads: a JSON object of schema security-gate/lock whose
+    schema_version is an integer above them all. Nothing else in it is read,
+    and anything else is None: not JSON, not an object, another schema, a
+    version that is no integer (a string, a boolean, 3.0) or not above them."""
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != LOCK_SCHEMA:
+        return None
+    version = doc.get("schema_version")
+    if isinstance(version, int) and not isinstance(version, bool) and version > max(LOCK_SCHEMA_VERSIONS):
+        return version
+    return None
+
+
+# The line of gate.py that declares the lock.json schemas it reads.
+_LOCK_SCHEMAS_LINE = re.compile(rb"^LOCK_SCHEMA_VERSIONS = \(([0-9, ]+)\)$", re.MULTILINE)
+
+
+def lock_schemas_declared(data: bytes) -> tuple[int, ...]:
+    """The lock.json schemas a gate.py declares, read as data: it is never
+    imported or run. Only one line counts, written exactly as
+    `LOCK_SCHEMA_VERSIONS = (1, 2)` from its first column to its end (digits,
+    commas and spaces between the parentheses, nothing after them, no CR),
+    and only if it is the one such line of the file and its literal is a
+    non-empty tuple of integers. Anything else declares nothing: no such
+    line, two of them, (3) (an integer), (1,,2) or (01) (no literal)."""
+    lines = _LOCK_SCHEMAS_LINE.findall(data)
+    if len(lines) != 1:
+        return ()
+    try:
+        versions = ast.literal_eval("(" + lines[0].decode("ascii") + ")")
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return ()
+    if not isinstance(versions, tuple) or not all(isinstance(v, int) and not isinstance(v, bool) for v in versions):
+        return ()
+    return versions
+
+
+def head_lock_schemas(git: Git, entries: list[Entry], changed: list[tuple[str, str]]) -> tuple[int, ...]:
+    """The lock.json schemas that gate.py of the head declares
+    (lock_schemas_declared), if the pull request modifies it and it is a
+    regular file of at most MAX_GATE_BYTES; else none."""
+    if ("M", GATE_PATH) not in changed:
+        return ()
+    entry = next((e for e in entries if e.path == GATE_PATH), None)
+    if entry is None or entry.kind != "blob" or entry.mode not in FILE_MODES:
+        return ()
+    try:
+        return lock_schemas_declared(git.blob_bytes(entry.oid, MAX_GATE_BYTES))
+    except GitError:
+        return ()
+
+
 # ---------------------------------------------------------------------------
 # Containers
 # ---------------------------------------------------------------------------
@@ -973,16 +1041,17 @@ def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *,
                  markers: list[str], items: list[dict], below: int, problems: list[tuple[str, str]],
                  rules_loaded: int | None, rules_sha256: str, databases: list | None = None,
                  fetch: dict | None = None, rulesets: list | None = None,
-                 listing: str | None = None, signal: list | None = None,
+                 listing: str | None = None, signal: list | None = None, below_items: list | None = None,
                  tool_id: str | None = None) -> tuple[dict, list[tuple[str, str]]]:
     """The tool's receipt and its reasons. Findings at or above the threshold
     are a fail; any problem without such a finding is inconclusive. listing
     replaces the plain list of findings in the reason. signal: findings at
     or above the threshold that do not block (semgrep's Registry rules under
-    policy registry: signal); they are no reason. tool_id: the id of a
-    second run of the same tool (semgrep with the Registry rules), else the
-    name."""
-    signal = signal or []
+    policy registry: signal); they are no reason. below_items: the findings
+    below the threshold, listed (the gate's own semgrep rules only). tool_id:
+    the id of a second run of the same tool (semgrep with the Registry
+    rules), else the name."""
+    signal, listed = signal or [], (below_items or [])[:MAX_ITEMS]
     reasons = []
     if items:
         shown_items = listing or ("; ".join(f"{i['rule']} {shown(i['path'])}" + (f":{i['line']}" if i["line"] else "")
@@ -1012,7 +1081,8 @@ def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *,
         "retried": run.retried,
         "findings": {"total": len(items), "by_severity": severity_counts(items), "items": items[:MAX_ITEMS],
                      "truncated": len(items) > MAX_ITEMS, "below_threshold": below, "signal": len(signal),
-                     "signal_items": signal[:MAX_ITEMS]},
+                     "signal_items": signal[:MAX_ITEMS], "below_items": listed,
+                     "below_truncated": bool(listed) and below > len(listed)},
         "databases": databases or [],
         "rulesets": rulesets or [],
         "fetch": fetch,
@@ -1145,7 +1215,8 @@ def gate_integrity(s: Scan) -> dict:
         "stderr_markers": [],
         "retried": False,
         "findings": {"total": len(items), "by_severity": severity_counts(items), "items": items[:MAX_ITEMS],
-                     "truncated": len(items) > MAX_ITEMS, "below_threshold": 0, "signal": 0, "signal_items": []},
+                     "truncated": len(items) > MAX_ITEMS, "below_threshold": 0, "signal": 0, "signal_items": [],
+                     "below_items": [], "below_truncated": False},
         "databases": [],
         "rulesets": [],
         "fetch": None,
@@ -2217,17 +2288,51 @@ def python_encoding(path: str, data: bytes) -> str | None:
     return None if _NON_ASCII.sub("", python) == _NON_ASCII.sub("", semgrep) else name
 
 
+# The gate's own rules whose findings are about a variable: a finding of
+# theirs below the threshold names it in the receipt and the job summary
+# (findings.below_items). The name is the variable's only, read from the
+# file semgrep was given at the start of the match, which is always the
+# name in these rules: never a value.
+SEMGREP_NAMED_RULES = frozenset({"sg-public-secret", "sg-public-key"})
+MAX_NAME = 128
+_SEMGREP_NAME = re.compile(rb"[A-Z][A-Za-z0-9_]*")
+_WORD_BYTE = re.compile(rb"[A-Za-z0-9_]")
+# The escapes of a line break or a tab written into a string (printf, echo
+# -e, a template): the rules read a name right after them as a whole word.
+_NAME_ESCAPES = (b"\\n", b"\\r", b"\\t")
+
+
+def semgrep_name(data: bytes | None, start: object, end: object) -> str | None:
+    """The variable name at the start of a match of semgrep (byte offsets
+    start and end in the file it was given), or None: only a whole word of
+    ASCII letters, digits and underscores that starts with a capital (the
+    public prefix), at most MAX_NAME characters. A word right after the
+    escape \\n, \\r or \\t counts as whole, as it does in the rules."""
+    if data is None or not isinstance(start, int) or not isinstance(end, int) or isinstance(start, bool) \
+            or isinstance(end, bool) or not 0 <= start < end <= len(data):
+        return None
+    m = _SEMGREP_NAME.match(data, start, min(end, start + MAX_NAME + 1))
+    if not m or len(m.group()) > MAX_NAME:
+        return None
+    if _WORD_BYTE.match(data[start - 1:start] if start else b"") and data[max(start - 2, 0):start] not in _NAME_ESCAPES:
+        return None
+    if _WORD_BYTE.match(data[m.end():m.end() + 1]):
+        return None
+    return m.group().decode("ascii")
+
+
 def semgrep_canaries() -> tuple[dict, ...]:
     """The files of canary/ and the rule each must trip, made at run time so
     that this file trips none of them. A canary counts only in the run of
     its source: the gate's in the run of the gate's rules, the Registry's in
     the run of the downloaded rulesets. A blocking canary counts only as a
-    finding that fails under the policy; the canary of the warning rule
-    counts when it is reported at all, since the rule never blocks. Whether
-    a canary of the Registry blocks is policy registry of lock.json. The
-    sg-supabase-secret-key canary is a Vue component: it also shows that the
-    regex rules read code semgrep has no analyzer for."""
-    public = "NEXT_" + "PUBLIC_"
+    finding that fails under the policy; the canaries of the warning rules
+    (sg-llm-no-output-limit, sg-public-key) count when they are reported at
+    all, since those rules never block. Whether a canary of the Registry
+    blocks is policy registry of lock.json. The sg-supabase-secret-key canary
+    is a Vue component: it also shows that the regex rules read code semgrep
+    has no analyzer for."""
+    public, vite = "NEXT_" + "PUBLIC_", "VI" + "TE_"
     return (
         {"id": "semgrep-sg-public-secret", "expected_rule": "sg-public-secret", "blocking": True,
          "file": "web/public-secret.ts", "content": f"export const key = process.env.{public}SG_CANARY_SECRET_KEY;\n"},
@@ -2239,6 +2344,8 @@ def semgrep_canaries() -> tuple[dict, ...]:
         {"id": "semgrep-sg-supabase-secret-key", "expected_rule": "sg-supabase-secret-key", "blocking": True,
          "file": "web/key.vue",
          "content": "<script setup>\nconst key = \"sb_" + "secret_security-gate-canary\";\n</script>\n"},
+        {"id": "semgrep-sg-public-key", "expected_rule": "sg-public-key", "blocking": False,
+         "file": "web/public-key.ts", "content": f"export const token = import.meta.env.{vite}SG_CANARY_TOKEN;\n"},
         {"id": "semgrep-registry", "expected_rule": SEMGREP_REGISTRY_CANARY_RULE, "blocking": None, "registry": True,
          "file": "registry.py", "content": "import subprocess\n\nsubprocess.call(command, " + "shell=True)\n"},
         {"id": "semgrep-registry-js", "expected_rule": SEMGREP_REGISTRY_JS_CANARY_RULE, "blocking": None,
@@ -2407,7 +2514,8 @@ def semgrep_post_filter(findings: list[dict], owned: bytes | None, reference: by
 
 def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: list[list[str]], rules_given: int,
                   rule_ids: set[str], policy: dict, *, registry: bool, own_ids: frozenset[str] | set[str] = frozenset(),
-                  owned: bytes | None = None, reference: bytes | None = None, confirmed: bool = False) -> dict:
+                  owned: bytes | None = None, reference: bytes | None = None, confirmed: bool = False,
+                  read: Callable[[str], bytes | None] | None = None) -> dict:
     """Pure: findings, canaries, coverage and the rule count from one
     semgrep run on the scanning roots tree/, tree-1/, ... (the head, see
     semgrep_roots) and canary/. The gate runs semgrep twice: with its own
@@ -2418,7 +2526,11 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
     those rules. A finding under another id is a tool error. own_ids, in the
     run of the Registry: the ids of the gate's rules, which a downloaded
     ruleset may not use. The post-filter (owned, reference, confirmed)
-    applies to the run of the Registry, whose rule it removes."""
+    applies to the run of the Registry, whose rule it removes. The findings
+    of the gate's rules below the threshold are listed (below_items), with
+    the variable name for SEMGREP_NAMED_RULES: read(path) gives the file
+    semgrep was given under the path of its report, or None. Nothing else
+    is read."""
     problems: list[tuple[str, str]] = []
     clash = set(own_ids) & rule_ids if registry else set()
     if clash:
@@ -2455,7 +2567,7 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
     # Registry's in the run of the Registry.
     canaries = [c for c in semgrep_canaries() if bool(c.get("registry")) == registry]
     hits: dict[str, list[str]] = {c["id"]: [] for c in canaries}
-    raw, unknown = [], set()
+    raw, unknown, spans = [], set(), {}
     for r in results:
         try:
             rule, path, line = r["check_id"], r["path"], r["start"]["line"]
@@ -2474,6 +2586,9 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
                     hits[c["id"]].append(severity_of(r))
         elif rel is not None:
             raw.append({"rule": rule, "path": rel, "line": line if line > 0 else None, "severity": severity_of(r)})
+            start, end = r.get("start") or {}, r.get("end") or {}
+            if not registry and rule in SEMGREP_NAMED_RULES and isinstance(end, dict):
+                spans.setdefault((rule, rel, raw[-1]["line"]), (path, start.get("offset"), end.get("offset")))
         else:
             problems.append(("tool_error", "semgrep reported a file outside the scanned directories"))
     if unknown:
@@ -2486,7 +2601,8 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
     # At or above the threshold, a finding of the gate's rules fails; one of
     # the Registry's fails only under registry: block, else it is a signal.
     blocks = not registry or policy["registry"] == "block"
-    items, signal, seen, below = [], [], set(), 0
+    items, signal, below_items, seen, below = [], [], [], set(), 0
+    text: tuple[str, bytes | None] = ("", None)   # the last file read: one at a time, files are large
     for f in kept:
         item = dict(f, fingerprint=sha256_hex(canonical(["semgrep", f["rule"], f["path"], f["line"]])))
         if item["fingerprint"] in seen:
@@ -2494,6 +2610,13 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
         seen.add(item["fingerprint"])
         if RANK[item["severity"]] < RANK[policy["min_severity"]]:
             below += 1
+            if not registry and len(below_items) < MAX_ITEMS:
+                name, span = None, spans.get((f["rule"], f["path"], f["line"]))
+                if span and read is not None:
+                    if text[0] != span[0]:
+                        text = (span[0], read(span[0]))
+                    name = semgrep_name(text[1], span[1], span[2])
+                below_items.append(dict(item, name=name))
         elif blocks:
             items.append(item)
         else:
@@ -2566,8 +2689,9 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
                   if root + path in scanned_raw)
     if total and not scanned:
         problems.append(("zero_scanned", f"semgrep scanned 0 of the {total} file(s) it was given"))
-    return {"items": items, "signal": signal, "below": below, "canaries": found, "removed": removed, "loaded": loaded,
-            "scanned": scanned, "unparsed": sorted(unparsed - set(gaps)), "problems": problems}
+    return {"items": items, "signal": signal, "below": below, "below_items": below_items, "canaries": found,
+            "removed": removed, "loaded": loaded, "scanned": scanned, "unparsed": sorted(unparsed - set(gaps)),
+            "problems": problems}
 
 
 def load_semgrep_rules(s: Scan) -> tuple[bytes | None, tuple[str, str] | None]:
@@ -2748,12 +2872,25 @@ def run_semgrep(s: Scan) -> dict:
                      "paths_truncated": False, "lockfiles": [], "unreadable": None, "transcoded": transcoded,
                      "regex_only": len(limited), "regex_only_paths": limited[:MAX_PATHS]},
             canaries=j["canaries"], markers=[], items=j["items"], below=j["below"], problems=extra + j["problems"],
-            rules_loaded=j["loaded"], rules_sha256=rules_sha256, signal=j["signal"], **more)
+            rules_loaded=j["loaded"], rules_sha256=rules_sha256, signal=j["signal"], below_items=j["below_items"],
+            **more)
         return receipt, [(code, detail, tool_id) for code, detail in reasons]
+
+    def given_file(path: str) -> bytes | None:
+        """The file semgrep was given under the path of its report."""
+        root, _, rel = path.partition("/")
+        target = safe_join(root_dirs[roots.index(root)], rel) if root in roots else None
+        try:
+            if target is None or target.is_symlink() or not target.is_file() or target.stat().st_size > MAX_SEMGREP_FILE:
+                return None
+            return target.read_bytes()
+        except OSError:
+            return None
 
     own_given, own_ids = ruleset_rules(own)
     argv, run, report = scan(["--config", "rules/security-gate.yml"], (rules_dir, "/sg/rules", True), work / "out")
-    j = judge_semgrep(report, run.err, run.code, given, own_given, own_ids, spec["policy"], registry=False)
+    j = judge_semgrep(report, run.err, run.code, given, own_given, own_ids, spec["policy"], registry=False,
+                      read=given_file)
     own_receipt, reasons = receipt_of(name, argv, run, j, run_problem(name, run, (0, 1)) + problems,
                                       sha256_hex(canonical([["security-gate", sha256_hex(own)]])))
     if configs:
@@ -2764,7 +2901,8 @@ def run_semgrep(s: Scan) -> dict:
         extra = run_problem(name, run, (0, 1)) + problems + fetched
     else:   # nothing usable was downloaded: the reasons are in fetched
         argv, run = [], Run(code=None, detail="not run: no usable ruleset")
-        j = {"items": [], "signal": [], "below": 0, "removed": [], "loaded": None, "scanned": 0, "unparsed": [],
+        j = {"items": [], "signal": [], "below": 0, "below_items": [], "removed": [], "loaded": None, "scanned": 0,
+             "unparsed": [],
              "problems": [], "canaries": [{"id": c["id"], "expected_rule": c["expected_rule"], "found": False}
                                           for c in semgrep_canaries() if c.get("registry")]}
         extra = problems + fetched
@@ -2800,7 +2938,7 @@ def new_receipt() -> dict:
         "subject": {"head_sha": None, "default_branch": None, "merge_base": None, "commits": None,
                     "canary_commit": None, "pr_number": None},
         "trusted": {"gate_sha": None, "skill_version": GATE_VERSION, "lock_sha256": None, "config_source": "default",
-                    "head_config_fingerprint": None, "confirmed": False},
+                    "head_lock_schema_version": None, "head_config_fingerprint": None, "confirmed": False},
         "self_check": {"outcome": INCONCLUSIVE, "failed": []},
         "trust_checks": [{"id": "SG-TRUST-001", "outcome": INCONCLUSIVE, "paths": []}],
         "tools": [],
@@ -2940,6 +3078,31 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     # else the default branch's.
     config = head if sg001 == PASS else gate_sha
     lock, lock_bytes, problem = load_lock(git, config)
+    # A confirmed new gate.py may bring a lock.json of a schema this gate does
+    # not read. Then the scanners of the default branch judge the pull
+    # request, lock.json and semgrep-rules.yml together, as if it left them
+    # alone: the new ones take effect with the new gate, after the merge
+    # (ADR 0003, 12). Only if that gate.py declares the schema: its one line
+    # LOCK_SCHEMA_VERSIONS = (...) is read as data, never run, and can only
+    # refuse the fallback, never choose a configuration. A gate.py that does
+    # not declare it (unchanged, a comment or a mode changed, another tuple,
+    # another line) would not read that lock.json after the merge, and it
+    # stays inconclusive; so does any other problem.
+    ahead = lock_schema_ahead(lock_bytes) if problem and config == head and LOCK_PATH in changed_paths else None
+    if ahead is not None and ahead not in head_lock_schemas(git, entries, changed):
+        problem = (problem[0], (f"{problem[1]}; {GATE_PATH} of the head does not declare schema_version {ahead} "
+                                f"(exactly one line LOCK_SCHEMA_VERSIONS = (...) that lists it), so no gate would "
+                                f"read it after the merge"))
+    elif ahead is not None:
+        default_lock = load_lock(git, gate_sha)
+        if default_lock[2] is None:
+            config = gate_sha
+            lock, lock_bytes, problem = default_lock
+            tr["config_source"] = "default_newer_schema"
+            tr["head_lock_schema_version"] = ahead
+        else:
+            problem = (problem[0], (f"{problem[1]}; {LOCK_PATH} of the default branch cannot judge the pull "
+                                    f"request instead: {default_lock[2][1]}"))
     tr["lock_sha256"] = sha256_hex(lock_bytes) if lock_bytes is not None else None
     if problem:
         add_reason(receipt, problem[0], problem[1])
@@ -3002,14 +3165,37 @@ NOT_CHECKED = ("composite actions, dependabot.yml and anything else outside .git
                "Semgrep rules and the Semgrep Registry rules of lock.json, whose findings only signal and never fail "
                "the gate unless lock.json sets them to block, and only through their regex rules where semgrep has "
                "no analyzer for the code (Vue, Svelte, Astro and HTML components, .mts, .cts, scripts without an "
-               "extension, notebooks) or cannot parse it; row level security of Supabase migrations and Firebase "
+               "extension, notebooks) or cannot parse it; values that reach the browser or app bundle without a "
+               "documented public prefix (a custom envPrefix or publicPrefix, next.config env, Nuxt "
+               "runtimeConfig.public, Astro envField, SvelteKit public: true, Angular environments, DefinePlugin "
+               "and EnvironmentPlugin, Expo extra) or with the bare PUBLIC_ prefix elsewhere than after env., right "
+               "before = in an environment file, in an import from $env/static/public or $env/dynamic/public and "
+               "in a workflow; the variable a public one is fed from ($X, ${X}, ${{ env.X }}, process.env.X: only "
+               "the name of a GitHub secret is read); whether a public key the gate does not know as publishable "
+               "is a secret "
+               "(sg-public-key only warns); row level security of Supabase migrations and Firebase "
                "rules; new packages (whether they exist and how old they are)")
+
+
+def config_notice(receipt: dict) -> str | None:
+    """What a reviewer must know when the default branch's scanners judged a
+    confirmed lock.json of a newer schema, or None."""
+    tr = receipt["trusted"]
+    if tr["config_source"] != "default_newer_schema":
+        return None
+    return (f"this gate (v{tr['skill_version']}) cannot read lock.json schema_version {tr['head_lock_schema_version']} "
+            f"of the head, so the pull request was judged by the scanners of the default branch (its {LOCK_PATH} "
+            f"and {SEMGREP_RULES_PATH}). The new scanners take effect after the merge; the first pull request after "
+            f"it shows whether they find their canaries")
 
 
 def report(receipt: dict) -> None:
     outcome = receipt["outcome"]
     print(f"security-gate: {outcome.upper()} (exit {receipt['exit_code']})")
     print(f"security-gate: not checked by this version: {NOT_CHECKED}")
+    notice = config_notice(receipt)
+    if notice:
+        print("::warning title=security-gate configuration::" + annotate(notice))
     for r in receipt["reasons"]:
         level = "error" if outcome != PASS else "notice"
         print(f"::{level} title=security-gate {r['code']}::" + annotate(r["detail"]))
@@ -3019,6 +3205,8 @@ def report(receipt: dict) -> None:
     lines = [f"## security-gate: {outcome}", ""]
     lines += [f"- self-check: {receipt['self_check']['outcome']}",
               f"- SG-TRUST-001: {receipt['trust_checks'][0]['outcome']}"]
+    if notice:
+        lines.append(f"- scanner configuration: {notice}")
     for t in receipt["tools"]:
         scanned = t["scanned"]
         counts = ", ".join(f"{scanned[k]} {k}" for k in ("files", "commits", "packages") if scanned[k] is not None)
@@ -3038,6 +3226,13 @@ def report(receipt: dict) -> None:
                      + (f" and {below} below the threshold (not blocking)" if below else "")
                      + f", {counts or 'nothing'} scanned" + (f" ({'; '.join(notes)})" if notes else "")
                      + f", canaries {canaries}/{len(t['canaries'])}")
+        listed = t["findings"].get("below_items") or []
+        if listed:
+            more = below - min(5, len(listed))
+            lines.append(f"  - {below} below the threshold, not blocking: "
+                         + "; ".join(md(f"{shown(i['rule'])} {shown(i['path'])}" + (f":{i['line']}" if i["line"] else "")
+                                        + (f" {i['name']}" if i.get("name") else "")) for i in listed[:5])
+                         + (f" and {more} more (receipt)" if more else ""))
         signal = t["findings"]["signal_items"]
         if t["findings"]["signal"]:
             more = t["findings"]["signal"] - min(5, len(signal))
