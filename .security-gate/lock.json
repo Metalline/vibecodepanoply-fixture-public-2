@@ -1,5 +1,5 @@
 {
-  "comment": "managed-by: security-gate v0.1.0-b1 (owned). The scanners of the pull request gate, pinned by image digest, and their thresholds. A pull request that changes this file is not trusted until a human confirms it (SG-TRUST-001). Contract: docs/contracts/lock.md.",
+  "comment": "managed-by: security-gate v0.1.0-b2 (owned). The scanners of the pull request gate, pinned by image digest, and their thresholds. A pull request that changes this file is not trusted until a human confirms it (SG-TRUST-001). Contract: docs/contracts/lock.md.",
   "schema": "security-gate/lock",
   "schema_version": 2,
   "tools": {

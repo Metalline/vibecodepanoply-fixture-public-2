@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b1 (owned)
+# managed-by: security-gate v0.1.0-b2 (owned)
 #
 # The security gate's own Semgrep rules. The gate runs them from the default
 # branch in a Semgrep call of their own, apart from the Semgrep Registry rules
@@ -32,36 +32,86 @@
 # files without the text the last one looks for (ADR 0006). The two entries
 # of an id below look for the same names (process.env and import.meta.env;
 # chat.completions.create and responses.create), and tests/semgrep_fixtures.py
-# has a case for every entry.
+# has a case for every entry. sg-public-secret and sg-public-key are one
+# entry each; they may report the same name, ERROR and WARNING on one line.
+#
+# The two rules on public variables share one list of public prefixes: the
+# prefixes that Next.js, Nuxt, Expo, Create React App, Vue CLI, Gatsby, Vite
+# (and electron-vite), Plasmo, Nx, Waku, Extension.js, Sanity Studio,
+# Storybook, Umi, Taro, WXT and RedwoodJS compile into the client (ADR 0007).
+# The bare PUBLIC prefix (SvelteKit, Astro, Qwik, Rsbuild, Vike) counts only
+# where it is a prefix: after env and a dot, right before = (an environment
+# file), before an import from $env/static/public or $env/dynamic/public,
+# and fed from a GitHub secret in a workflow. The prefix is matched in
+# capitals, as the bundler matches it; the rest of the name in any case. A
+# name starts a word, or follows the escape \n, \r or \t in a string that
+# writes an environment file (printf, echo -e, a template literal): \b
+# alone takes the escape's letter for a part of the word. A name ends in a
+# whole KEY or TOKEN segment (or APIKEY), or in a camelCase Key or Token
+# (apiKey). Every name starts with (?![A-Za-z0-9_]{129}): a word of more
+# than 128 characters is no name, and without that bound one such word
+# makes PCRE drop a pattern in the whole file, silently (ADR 0007). For
+# the same reason the two parts of a JWT read as a value are bounded, to
+# 1024 and 4096 characters (a Supabase key has about 200).
+# Not checked: custom prefixes (envPrefix and the like), channels without a
+# prefix (next.config env, Nuxt runtimeConfig, Astro envField, Angular
+# environments, DefinePlugin, Expo extra), and the name of the variable a
+# public one is fed from, but for a GitHub secret (${X} in an environment
+# file, compose or a Dockerfile, ${{ env.X }}, process.env.X).
 rules:
   # A variable with a public prefix is compiled into the browser or app
-  # bundle (Next.js, Vite, Expo). Its name says it is a secret: SECRET,
-  # SERVICE_ROLE, SERVICE_KEY or PRIVATE in it, or it is the key or token of
-  # an LLM or email API, which are never publishable; or its value is a
-  # secret key, a GitHub secret with such a name included. Publishable names
-  # and values (ANON_KEY, PUBLISHABLE_KEY, SITE_KEY, pk_ keys, Firebase
-  # apiKey) do not match. Regex rule: it reads code, environment and config
-  # files and workflows alike; not prose, which names such variables to warn
-  # about them.
+  # bundle. Its name or its value says it holds a secret, and no allowlist
+  # applies: SECRET, SERVICE_ROLE, SERVICE_KEY or PRIVATE anywhere in the
+  # name; the key or token of a vendor that has no publishable keys (LLM,
+  # speech and email APIs, Twilio, OneSignal, GitHub, GitLab, Airtable,
+  # RapidAPI, SerpApi; the tokens of Sanity); a role right before the end,
+  # with API or ACCESS between them or not (an admin, master or server key,
+  # not the APPLICATION_SERVER_KEY of Web Push, which is a public key;
+  # an admin, bot, bearer, refresh, management, deploy, debug or Sentry auth
+  # token); a secret key as the value (sk_ and rk_ keys of any mode, whsec_,
+  # sk- keys of LLM APIs, PostHog phx_ phs_ pha_ phr_, Sentry sntry,
+  # OneSignal os_v2_app_, Paddle pdl_, Mapbox sk., LaunchDarkly sdk-,
+  # Supabase sb_secret_ and service_role JWTs), whatever the name; or, in a
+  # workflow, a GitHub secret named like that (the vendor a segment and KEY
+  # or TOKEN the end of the secret's name, or the role its end), after : or
+  # =. Regex rule: it reads code, environment and config files and workflows
+  # alike; not prose, which names such variables to warn about them.
   - id: sg-public-secret
     languages: [regex]
     severity: ERROR
     message: >-
-      A variable with a public prefix (NEXT_PUBLIC_, VITE_, EXPO_PUBLIC_) holds
-      a secret: the bundler writes its value into code that every visitor
-      downloads. Rename it without the public prefix, read it only on the
-      server, and rotate the key.
+      A variable with a public prefix (NEXT_PUBLIC_, VITE_, EXPO_PUBLIC_,
+      REACT_APP_, NUXT_PUBLIC_, PUBLIC_ and the like) holds a secret: its name
+      or its value says so. The bundler writes the value into the code that
+      every visitor or app user downloads. Make the call that needs it on the
+      server (an API route, server action or edge function), keep the key in a
+      variable without the public prefix, and rotate the key: the old one has
+      already shipped.
     metadata:
       category: security
+      confidence: HIGH
       cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
     paths:
       exclude: ["*.md", "*.mdx", "*.markdown", "*.rst", "*.adoc"]
     pattern-either:
-      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]*(?:SECRET|SERVICE_ROLE|SERVICE_KEY|PRIVATE)[A-Z0-9_]*
-      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_(?:[A-Z0-9]+_)*(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_GENERATIVE_AI|GROQ|MISTRAL|COHERE|DEEPSEEK|OPENROUTER|PERPLEXITY|REPLICATE|TOGETHER|FIREWORKS|XAI|ELEVENLABS|HUGGINGFACE|HF|RESEND|SENDGRID|MAILGUN|POSTMARK)(?:_[A-Z0-9]+)*_(?:KEY|TOKEN)\b
-      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]+["']?\s*[:=]\s*["'`]?(?:sb_secret_|sk_live_|rk_live_|sk-(?:proj|svcacct|admin|ant|or)-)
-      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]+["']?\s*[:=]\s*["'`]?eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*(?:c2VydmljZV9yb2xl|NlcnZpY2Vfcm9sZ|zZXJ2aWNlX3JvbG)
-      - pattern-regex: \b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC)_[A-Z0-9_]+["']?\s*:\s*["']?\$\{\{\s*secrets[.][A-Za-z0-9_]*(?i:secret|service_role|service_key|private|openai|anthropic|claude|gemini|google_generative_ai|groq|mistral|cohere|deepseek|openrouter|perplexity|replicate|together|fireworks|xai|elevenlabs|huggingface|hf|resend|sendgrid|mailgun|postmark)
+      # 1. SECRET, SERVICE_ROLE, SERVICE_KEY or PRIVATE anywhere in the name
+      - pattern-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|REDWOOD_ENV)_(?i:[A-Z0-9_]*(?:SECRET|SERVICE_?ROLE|SERVICE_?KEY|PRIVATE)[A-Z0-9_]*)
+      # 2. the key or token of a vendor that has no publishable keys
+      - pattern-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|REDWOOD_ENV)_+(?i:(?:[A-Z0-9]+_+)*(?:(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_GENERATIVE_AI|GENAI|GROQ|MISTRAL|COHERE|DEEPSEEK|OPENROUTER|PERPLEXITY|REPLICATE|TOGETHER|FIREWORKS|XAI|ELEVENLABS|HUGGINGFACE|HF|AI|LLM|CHATGPT|GROK|KIMI|MOONSHOT|DEEPGRAM|ASSEMBLYAI|RESEND|SENDGRID|MAILGUN|POSTMARK|MAILCHIMP|TWILIO|ONESIGNAL|GITHUB|GH|GITLAB|AIRTABLE|RAPIDAPI|RAPID_API|SERPAPI|SERP_API)(?:_+[A-Z0-9]+)*|SANITY(?:_+STUDIO)?(?:_+(?:API|READ|WRITE|EDITOR|VIEWER|PREVIEW|AUTH|DEPLOY))*))(?:_+(?i:(?:API_?)?(?:KEY|TOKEN))|(?<=[a-z0-9])(?:A(?i:PI))?(?:K(?i:EY)|T(?i:OKEN)))\b
+      # 3. a role right before the end of the name, API or ACCESS between
+      - pattern-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|REDWOOD_ENV)_+(?i:(?:[A-Z0-9]+_+)*)(?:(?i:ADMIN|MASTER|(?<!APPLICATION_)SERVER)(?:_+(?i:(?:(?:API|ACCESS)_*)*KEY)|(?<=[a-z0-9])(?:A(?i:PI|CCESS)_*)*K(?i:EY))|(?i:ADMIN|BOT|BEARER|REFRESH|MANAGEMENT|DEPLOY|SENTRY_AUTH|DEBUG(?:_+[A-Z0-9]+)?)(?:_+(?i:(?:(?:API|ACCESS)_*)*TOKEN)|(?<=[a-z0-9])(?:A(?i:PI|CCESS)_*)*T(?i:OKEN)))\b
+      # 4, 5. the bare PUBLIC prefix, with the names of 1 and 2: after env and
+      #    a dot; or right before =, before a GitHub secret of a workflow or
+      #    before an import from $env/static/public or $env/dynamic/public
+      - pattern-regex: (?<=env[.])(?![A-Za-z0-9_]{129})PUBLIC_+(?:(?i:[A-Z0-9_]*(?:SECRET|SERVICE_?ROLE|SERVICE_?KEY|PRIVATE)[A-Z0-9_]*)|(?i:(?:[A-Z0-9]+_+)*(?:(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_GENERATIVE_AI|GENAI|GROQ|MISTRAL|COHERE|DEEPSEEK|OPENROUTER|PERPLEXITY|REPLICATE|TOGETHER|FIREWORKS|XAI|ELEVENLABS|HUGGINGFACE|HF|AI|LLM|CHATGPT|GROK|KIMI|MOONSHOT|DEEPGRAM|ASSEMBLYAI|RESEND|SENDGRID|MAILGUN|POSTMARK|MAILCHIMP|TWILIO|ONESIGNAL|GITHUB|GH|GITLAB|AIRTABLE|RAPIDAPI|RAPID_API|SERPAPI|SERP_API)(?:_+[A-Z0-9]+)*|SANITY(?:_+STUDIO)?(?:_+(?:API|READ|WRITE|EDITOR|VIEWER|PREVIEW|AUTH|DEPLOY))*))(?:_+(?i:(?:API_?)?(?:KEY|TOKEN))|(?<=[a-z0-9])(?:A(?i:PI))?(?:K(?i:EY)|T(?i:OKEN)))\b)
+      - pattern-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})PUBLIC_+(?:(?i:[A-Z0-9_]*(?:SECRET|SERVICE_?ROLE|SERVICE_?KEY|PRIVATE)[A-Z0-9_]*)|(?i:(?:[A-Z0-9]+_+)*(?:(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_GENERATIVE_AI|GENAI|GROQ|MISTRAL|COHERE|DEEPSEEK|OPENROUTER|PERPLEXITY|REPLICATE|TOGETHER|FIREWORKS|XAI|ELEVENLABS|HUGGINGFACE|HF|AI|LLM|CHATGPT|GROK|KIMI|MOONSHOT|DEEPGRAM|ASSEMBLYAI|RESEND|SENDGRID|MAILGUN|POSTMARK|MAILCHIMP|TWILIO|ONESIGNAL|GITHUB|GH|GITLAB|AIRTABLE|RAPIDAPI|RAPID_API|SERPAPI|SERP_API)(?:_+[A-Z0-9]+)*|SANITY(?:_+STUDIO)?(?:_+(?:API|READ|WRITE|EDITOR|VIEWER|PREVIEW|AUTH|DEPLOY))*))(?:_+(?i:(?:API_?)?(?:KEY|TOKEN))|(?<=[a-z0-9])(?:A(?i:PI))?(?:K(?i:EY)|T(?i:OKEN)))\b)\b(?:(?==(?!=))|(?=["']?\s*[:=]\s*["']?\$\{\{\s*secrets(?:[.]|\[))|(?=[\w\s,]{0,500}+\}\s*from\s*["']\$env/(?:static|dynamic)/public["']))
+      # 6, 7. a secret key or a service_role JWT as the value, whatever the
+      #    name; the bare PUBLIC prefix only right before =
+      - pattern-regex: (?:(?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|REDWOOD_ENV)_[A-Za-z0-9_]+["']?\s*[:=]\s*|(?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})PUBLIC_+[A-Za-z0-9_]+=(?!=))["'`]?(?:sb_secret_|(?:sk|rk)_[A-Za-z0-9]{3}|whsec_|sk-(?:proj|svcacct|admin|ant|or)-|sk-[A-Za-z0-9]{20}|ph[xsar]_|sntry[usai]_|os_v2_app_|pdl_(?:live|sdbx)_apikey_|sk[.]eyJ|sdk-[0-9a-f]{8}-)
+      - pattern-regex: (?:(?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|REDWOOD_ENV)_[A-Za-z0-9_]+["']?\s*[:=]\s*|(?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})PUBLIC_+[A-Za-z0-9_]+=(?!=))["'`]?eyJ[A-Za-z0-9_-]{0,1024}\.[A-Za-z0-9_-]{0,4096}(?:c2VydmljZV9yb2xl|NlcnZpY2Vfcm9sZ|zZXJ2aWNlX3JvbG)
+      # 8. a GitHub secret with such a name, in a workflow (secrets.X or
+      #    secrets['X'], after : or =)
+      - pattern-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|PUBLIC|REDWOOD_ENV)_[A-Za-z0-9_]+["']?\s*[:=]\s*["']?\$\{\{\s*secrets(?:[.]|\[\s*["'])(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*(?:SECRET|SERVICE_?ROLE|SERVICE_?KEY|PRIVATE)|(?:[A-Z0-9]+_+)*(?:(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_GENERATIVE_AI|GENAI|GROQ|MISTRAL|COHERE|DEEPSEEK|OPENROUTER|PERPLEXITY|REPLICATE|TOGETHER|FIREWORKS|XAI|ELEVENLABS|HUGGINGFACE|HF|AI|LLM|CHATGPT|GROK|KIMI|MOONSHOT|DEEPGRAM|ASSEMBLYAI|RESEND|SENDGRID|MAILGUN|POSTMARK|MAILCHIMP|TWILIO|ONESIGNAL|GITHUB|GH|GITLAB|AIRTABLE|RAPIDAPI|RAPID_API|SERPAPI|SERP_API)(?:_+[A-Z0-9]+)*|SANITY(?:_+STUDIO)?(?:_+(?:API|READ|WRITE|EDITOR|VIEWER|PREVIEW|AUTH|DEPLOY))*)_+(?:API_?)?(?:KEY|TOKEN)\b|(?:[A-Z0-9]+_+)*(?:(?:ADMIN|MASTER|(?<!APPLICATION_)SERVER)_+(?:(?:API|ACCESS)_*)*KEY|(?:ADMIN|BOT|BEARER|REFRESH|MANAGEMENT|DEPLOY|SENTRY_AUTH|DEBUG(?:_+[A-Z0-9]+)?)_+(?:(?:API|ACCESS)_*)*TOKEN)\b)
 
   # The Supabase service_role key or a secret key (sb_secret_) bypasses row
   # level security. In code that runs in the browser or in the app it is
@@ -99,6 +149,8 @@ rules:
   # Components of Vue and Svelte and the scripts of HTML pages run in the
   # browser too. semgrep has no JavaScript analyzer for them, so this entry
   # reads their text ([.] is a dot); it reads no file the entry above reads.
+  # The name is bounded to 128 characters, as in the rules on public
+  # variables: a longer word after env and a dot would drop it in the file.
   - id: sg-service-role-client
     languages: [regex]
     severity: ERROR
@@ -111,11 +163,12 @@ rules:
       cwe: "CWE-798: Use of Hard-coded Credentials"
     paths:
       include: ["*.vue", "*.svelte", "*.html", "*.htm"]
-    pattern-regex: \b(?:process|import[.]meta)[.]env[.][A-Za-z0-9_]*(?i:service_?(?:role|key))
+    pattern-regex: \b(?:process|import[.]meta)[.]env[.](?![A-Za-z0-9_]{129})[A-Za-z0-9_]*(?i:service_?(?:role|key))
 
   # The Supabase secret key (sb_secret_) or a service_role JWT itself,
   # written into any file of the repository: code of any language, config,
   # environment files and prose.
+  # The JWT is bounded as in sg-public-secret.
   - id: sg-supabase-secret-key
     languages: [regex]
     severity: ERROR
@@ -129,7 +182,7 @@ rules:
       cwe: "CWE-798: Use of Hard-coded Credentials"
     pattern-either:
       - pattern-regex: \bsb_secret_[A-Za-z0-9_-]{10,}
-      - pattern-regex: \beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*(?:c2VydmljZV9yb2xl|NlcnZpY2Vfcm9sZ|zZXJ2aWNlX3JvbG)
+      - pattern-regex: \beyJ[A-Za-z0-9_-]{0,1024}\.[A-Za-z0-9_-]{0,4096}(?:c2VydmljZV9yb2xl|NlcnZpY2Vfcm9sZ|zZXJ2aWNlX3JvbG)
 
   # An OpenAI SDK call (Chat Completions or Responses API) without an output
   # limit. Only a warning: the limit caps the cost of one call, not the
@@ -173,3 +226,67 @@ rules:
           - pattern: $C.responses.create(...)
           - pattern-not: $C.responses.create(..., max_output_tokens=$X, ...)
           - pattern-not: $C.responses.create(..., **$KW)
+
+  # A variable with a public prefix holds a key or token that the gate does
+  # not know as publishable. Only a warning: many vendors issue keys meant
+  # for the browser, and only the vendor's documentation tells them apart.
+  # Not reported: the names below, publishable by design per the vendors'
+  # documentation (ADR 0007); sg-public-secret reports a secret among them
+  # by its value. The allowlist reads segments split by _, in any case: a
+  # publishable name in camelCase (supabaseAnonKey) still warns.
+  - id: sg-public-key
+    languages: [regex]
+    severity: WARNING
+    message: >-
+      A variable with a public prefix holds a key or token that the gate does
+      not know as publishable, so its value ships to every visitor or app user
+      and anyone can use it on your account. If the vendor calls this key safe
+      for browsers or apps (a publishable, site, client-side or search-only
+      key), make sure it has the restrictions the vendor recommends (allowed
+      domains, apps, scopes). Otherwise call the API from the server and keep
+      the key in a variable without the public prefix.
+    metadata:
+      category: security
+      confidence: LOW
+      cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
+    paths:
+      exclude: ["*.md", "*.mdx", "*.markdown", "*.rst", "*.adoc"]
+    patterns:
+      - pattern-either:
+          - pattern-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|REDWOOD_ENV)_+(?:(?i:(?:[A-Z0-9]+_+)*(?:API)?(?:KEY|TOKEN))|(?i:[A-Z0-9_]*?)(?<=[a-z0-9])(?:A(?i:PI))?(?:K(?i:EY)|T(?i:OKEN)))\b
+          - pattern-regex: (?<=env[.])(?![A-Za-z0-9_]{129})PUBLIC_+(?:(?i:(?:[A-Z0-9]+_+)+(?:API)?(?:KEY|TOKEN))|(?i:[A-Z0-9_]*?)(?<=[a-z0-9])(?:A(?i:PI))?(?:K(?i:EY)|T(?i:OKEN)))\b
+          - pattern-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})PUBLIC_+(?:(?i:(?:[A-Z0-9]+_+)+(?:API)?(?:KEY|TOKEN))|(?i:[A-Z0-9_]*?)(?<=[a-z0-9])(?:A(?i:PI))?(?:K(?i:EY)|T(?i:OKEN)))\b(?:(?==(?!=))|(?=["']?\s*[:=]\s*["']?\$\{\{\s*secrets(?:[.]|\[))|(?=[\w\s,]{0,500}+\}\s*from\s*["']\$env/(?:static|dynamic)/public["']))
+      # publishable and anon keys: Supabase, Stripe, Clerk, Magic
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:PUBLISHABLE|ANON)(?:_[A-Z0-9]+)?_(?:API_?)?(?:KEY|TOKEN))\b
+      # PUBLIC or PUB after a vendor, not the PUBLIC of a prefix: Stripe,
+      # VAPID, EmailJS, Paystack, Uploadcare, Liveblocks
+      - pattern-not-regex: (?:\b|(?<=\\[nrt]))(?![A-Za-z0-9_]{129})(?:NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|VUE_APP|GATSBY|(?:MAIN_|PRELOAD_|RENDERER_)?VITE|PLASMO_PUBLIC|NX_PUBLIC|WAKU_PUBLIC|EXTENSION_PUBLIC|SANITY_STUDIO|STORYBOOK|UMI_APP|TARO_APP|WXT|PUBLIC|REDWOOD_ENV)_+(?i:(?:[A-Z0-9]+_+)+(?:PUBLIC|PUB)_+(?:[A-Z0-9]+_+)?(?:API_?)?(?:KEY|TOKEN))\b
+      # the public key of Web Push (VAPID): the applicationServerKey of
+      # PushManager.subscribe, the vapidKey of Firebase Cloud Messaging
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:VAPID|APPLICATION_SERVER)_KEY)\b
+      # the apiKey of a Firebase web app
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:FIREBASE|FB)(?:_[A-Z0-9]+)?_API_?KEY)\b
+      # browser keys of maps
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:GOOGLE_MAPS|GOOGLE_PLACES|GMAPS?|MAPS?|MAPTILER|STADIA|HERE(?:_MAPS)?|ARCGIS|CESIUM_ION|MAPILLARY|YANDEX_MAPS|KAKAO(?:_SDK)?_(?:JS|JAVASCRIPT)|KAKAO_MAP(?:_APP)?)(?:_[A-Z0-9]+)?_(?:API_|ACCESS_|CLIENT_)?(?:KEY|TOKEN))\b
+      # public tokens of Mapbox (not DOWNLOADS)
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_MAPBOX(?:_ACCESS|_PUBLIC|_API|_GL)?_(?:TOKEN|KEY))\b
+      # site keys of CAPTCHA: Turnstile, reCAPTCHA, hCaptcha
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_SITE_?KEY)\b
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:RE)?CAPTCHA(?:_V[23])?_KEY)\b
+      # client keys of analytics, monitoring and feature flags
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:POSTHOG(?:_PROJECT)?(?:_API)?_(?:KEY|TOKEN)|MIX_?PANEL(?:_PROJECT)?_TOKEN|AMPLITUDE(?:_API)?_KEY|(?:SEGMENT|RUDDERSTACK)(?:_[A-Z0-9]+)?_WRITE_KEY|(?:DATADOG|DD)(?:_[A-Z0-9]+)?_CLIENT_TOKEN|SENTRY(?:_PUBLIC)?_KEY|BUGSNAG(?:_API)?_KEY|STATSIG(?:_CLIENT)?(?:_SDK)?_KEY|LD_CLIENT(?:_SIDE)?_KEY|LAUNCHDARKLY_CLIENT(?:_SIDE)?_KEY))\b
+      # app keys of realtime clients: Pusher, Laravel Reverb, Stream
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:PUSHER(?:_APP)?|REVERB_APP|STREAM_API)_KEY)\b
+      # search-only keys: Algolia, Meilisearch, Typesense
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:ALGOLIA(?:SEARCH)?|MEILI(?:SEARCH)?|TYPESENSE)(?:_API)?_SEARCH(?:_ONLY)?(?:_API)?_KEY)\b
+      # the SDK keys of RevenueCat per platform
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:REVENUECAT|RC)_(?:IOS|ANDROID|APPLE|GOOGLE|AMAZON|WEB)(?:_API)?_KEY)\b
+      # client keys of commerce: Shopify Storefront, Paddle, Adyen,
+      # Braintree, Fortmatic
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:(?:SHOPIFY_)?STOREFRONT(?:_ACCESS|_API|_PUBLIC)?_TOKEN|PADDLE_CLIENT(?:_SIDE)?_TOKEN|ADYEN_CLIENT_KEY|(?:BRAINTREE_)?TOKENIZATION_KEY|FORTMATIC(?:_API)?_KEY))\b
+      # keys the vendor puts into the client: Cloudinary, Infura, TinyMCE
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_(?:CLOUDINARY_API|INFURA(?:_API)?|TINYMCE(?:_API)?|TINY_API)_KEY)\b
+      # the read-only tokens of Upstash, meant for web and mobile clients
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_UPSTASH(?:_[A-Z0-9]+)*_READ_?ONLY_TOKEN)\b
+      # the name of a storage key, not a credential
+      - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_TOKEN(?:_STORAGE|_COOKIE|_PERSIST)?_KEY)\b

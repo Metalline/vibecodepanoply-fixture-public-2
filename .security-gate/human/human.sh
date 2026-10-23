@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# managed-by: security-gate v0.1.0-b1 (owned)
+# managed-by: security-gate v0.1.0-b2 (owned)
 #
 # Steps of the security gate that only a human runs, in their own terminal and
 # with their own GitHub login. Do not hand this script to a coding agent.
