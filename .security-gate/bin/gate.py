@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b2 (owned)
+# managed-by: security-gate v0.1.0-b3 (owned)
 """security-gate: the pull request gate. Standard library only, Python 3.11+.
 
 The owned workflow .github/workflows/security-gate.yml runs this file from a
@@ -89,7 +89,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GATE_VERSION = "0.1.0-b2"
+GATE_VERSION = "0.1.0-b3"
 RECEIPT_SCHEMA = "security-gate/receipt"
 RECEIPT_SCHEMA_VERSION = 4
 FINGERPRINT_SCHEMA = "security-gate/fingerprint"
@@ -3170,11 +3170,11 @@ NOT_CHECKED = ("composite actions, dependabot.yml and anything else outside .git
                "runtimeConfig.public, Astro envField, SvelteKit public: true, Angular environments, DefinePlugin "
                "and EnvironmentPlugin, Expo extra) or with the bare PUBLIC_ prefix elsewhere than after env., right "
                "before = in an environment file, in an import from $env/static/public or $env/dynamic/public and "
-               "in a workflow; the variable a public one is fed from ($X, ${X}, ${{ env.X }}, process.env.X: only "
-               "the name of a GitHub secret is read); whether a public key the gate does not know as publishable "
-               "is a secret "
-               "(sg-public-key only warns); row level security of Supabase migrations and Firebase "
-               "rules; new packages (whether they exist and how old they are)")
+               "in a workflow; the variable a public one is fed from, but for $X and ${X} as the whole value, "
+               "process.env.X and a secret, variable or env of a workflow, whose names are read; whether a public "
+               "key the gate does not know as publishable is a secret (sg-public-key only warns); row level "
+               "security of Supabase migrations and Firebase rules; new packages (whether they exist and how old "
+               "they are)")
 
 
 def config_notice(receipt: dict) -> str | None:
