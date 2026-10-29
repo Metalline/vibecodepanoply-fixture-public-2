@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b3 (owned)
+# managed-by: security-gate v0.1.0-b4 (owned)
 """security-gate: the pull request gate. Standard library only, Python 3.11+.
 
 The owned workflow .github/workflows/security-gate.yml runs this file from a
@@ -23,8 +23,8 @@ The verdict of this version:
 - self-check: the run is the owned workflow on pull_request_target from the
   default branch, on a GitHub-hosted runner;
 - SG-TRUST-001: the protected files (.github/workflows/ and .security-gate/,
-  except state.json) of the head are compared with those of the default branch
-  tip, not of a merge base. Any difference is inconclusive, unless the
+  state.json included) of the head are compared with those of the default
+  branch tip, not of a merge base. Any difference is inconclusive, unless the
   fingerprint of the protected files in the head equals the repository
   variable SECURITY_GATE_CONFIG, which only a human sets (human.sh confirm).
   A merge base is not used: with several best common ancestors (criss-cross
@@ -61,6 +61,7 @@ The verdict of this version:
 Subcommands for human.sh:
     gate.py fingerprint --repo DIR --commit REV
     gate.py protected-diff --repo DIR --default REV --head REV [--patch]
+    gate.py actions-policy --body | --ids FILE | --list FILE --details DIR | --policy FILE
 """
 from __future__ import annotations
 
@@ -89,7 +90,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GATE_VERSION = "0.1.0-b3"
+GATE_VERSION = "0.1.0-b4"
 RECEIPT_SCHEMA = "security-gate/receipt"
 RECEIPT_SCHEMA_VERSION = 4
 FINGERPRINT_SCHEMA = "security-gate/fingerprint"
@@ -116,9 +117,11 @@ RECEIPT_ARTIFACT = "security-gate-receipt"
 
 # The protected set. Paths are compared in lower case, so a case variant of a
 # protected directory is protected too. A non-directory entry on the way to a
-# protected directory (".github" as a symlink) is protected as well.
+# protected directory (".github" as a symlink) is protected as well. Every
+# file under them is protected, .security-gate/state.json too (since
+# 0.1.0-b4): a module declined there weakens the installation, and that needs
+# a human (docs/contracts/state.md).
 PROTECTED_DIRS = (".github/workflows", ".security-gate")
-NOT_PROTECTED = frozenset({".security-gate/state.json"})
 LINK_MODE = "120000"
 FILE_MODES = frozenset({"100644", "100755"})
 
@@ -203,8 +206,6 @@ def shown(text: str) -> str:
 
 
 def is_protected(path: str) -> bool:
-    if path in NOT_PROTECTED:
-        return False
     low = path.lower()
     return any(low == d or low.startswith(d + "/") or d.startswith(low + "/") for d in PROTECTED_DIRS)
 
@@ -291,7 +292,10 @@ def raw_records(out: bytes) -> list[tuple[list[str], list[str], str, bytes]]:
 
 
 def git_environ(home: Path) -> dict[str, str]:
-    keep = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "TMPDIR")}
+    # Three variables of the runner by name, each kept when it is set (also to
+    # an empty value); nothing else of the environment reaches git.
+    found = {"PATH": os.getenv("PATH"), "SYSTEMROOT": os.getenv("SYSTEMROOT"), "TMPDIR": os.getenv("TMPDIR")}
+    keep = {k: v for k, v in found.items() if v is not None}
     return dict(keep, HOME=str(home), LC_ALL="C", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                 GIT_ATTR_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
                 GIT_NO_LAZY_FETCH="1", GIT_ADVICE="0")
@@ -896,10 +900,11 @@ class Docker:
         scratch.mkdir(parents=True, exist_ok=True)
         (scratch / "config").mkdir(exist_ok=True)
         (scratch / "home").mkdir(exist_ok=True)
-        self.environ = {"PATH": os.environ.get("PATH", ""), "HOME": str(scratch / "home"),
+        self.environ = {"PATH": os.getenv("PATH", ""), "HOME": str(scratch / "home"),
                         "DOCKER_CONFIG": str(scratch / "config")}
-        if os.environ.get("DOCKER_HOST"):
-            self.environ["DOCKER_HOST"] = os.environ["DOCKER_HOST"]
+        docker_host = os.getenv("DOCKER_HOST")
+        if docker_host:
+            self.environ["DOCKER_HOST"] = docker_host
         self.exe = shutil.which("docker", path=self.environ["PATH"])
         self.pulled: dict[str, str | None] = {}
 
@@ -2925,16 +2930,17 @@ def _int_or_none(value: str | None) -> int | None:
 
 
 def new_receipt() -> dict:
-    g = os.environ.get
+    workflow_sha = os.getenv("GITHUB_WORKFLOW_SHA")
     return {
         "schema": RECEIPT_SCHEMA,
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "mode": "pr",
-        "run": {"repository": g("GITHUB_REPOSITORY"), "event": g("GITHUB_EVENT_NAME"),
-                "workflow_ref": g("GITHUB_WORKFLOW_REF"),
-                "workflow_sha": g("GITHUB_WORKFLOW_SHA") if SHA1_RE.match(g("GITHUB_WORKFLOW_SHA") or "") else None,
-                "run_id": _int_or_none(g("GITHUB_RUN_ID")), "run_attempt": _int_or_none(g("GITHUB_RUN_ATTEMPT")),
-                "runner_environment": g("RUNNER_ENVIRONMENT")},
+        "run": {"repository": os.getenv("GITHUB_REPOSITORY"), "event": os.getenv("GITHUB_EVENT_NAME"),
+                "workflow_ref": os.getenv("GITHUB_WORKFLOW_REF"),
+                "workflow_sha": workflow_sha if SHA1_RE.match(workflow_sha or "") else None,
+                "run_id": _int_or_none(os.getenv("GITHUB_RUN_ID")),
+                "run_attempt": _int_or_none(os.getenv("GITHUB_RUN_ATTEMPT")),
+                "runner_environment": os.getenv("RUNNER_ENVIRONMENT")},
         "subject": {"head_sha": None, "default_branch": None, "merge_base": None, "commits": None,
                     "canary_commit": None, "pr_number": None},
         "trusted": {"gate_sha": None, "skill_version": GATE_VERSION, "lock_sha256": None, "config_source": "default",
@@ -2959,7 +2965,7 @@ def add_reason(receipt: dict, code: str, detail: str, tool: str | None = None) -
 
 
 def read_event(receipt: dict) -> dict:
-    path = os.environ.get("GITHUB_EVENT_PATH")
+    path = os.getenv("GITHUB_EVENT_PATH")
     try:
         with open(path or "", "rb") as fh:
             event = json.loads(fh.read())
@@ -2985,7 +2991,7 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
         add_reason(receipt, "unsupported_object_format", "the repository does not use SHA-1 object ids")
         return
     event = read_event(receipt)
-    head = os.environ.get("PR_HEAD_SHA", "")
+    head = os.getenv("PR_HEAD_SHA", "")
     if not SHA1_RE.match(head):
         add_reason(receipt, "invalid_document", "PR_HEAD_SHA is not a 40-hex commit id")
         return
@@ -3042,7 +3048,7 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     blobs = git.blobs(oids)
 
     # SG-TRUST-001
-    confirmed_set, well_formed = parse_config(os.environ.get("SG_CONFIG"))
+    confirmed_set, well_formed = parse_config(os.getenv("SG_CONFIG"))
     if not well_formed:
         add_reason(receipt, "invalid_document", f"{CONFIG_VARIABLE} is set but is not one sha256:<64 hex> "
                                                 "fingerprint")
@@ -3199,7 +3205,7 @@ def report(receipt: dict) -> None:
     for r in receipt["reasons"]:
         level = "error" if outcome != PASS else "notice"
         print(f"::{level} title=security-gate {r['code']}::" + annotate(r["detail"]))
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    summary = os.getenv("GITHUB_STEP_SUMMARY")
     if not summary:
         return
     lines = [f"## security-gate: {outcome}", ""]
@@ -3262,7 +3268,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
             frame = traceback.extract_tb(exc.__traceback__)[-1]
             add_reason(receipt, "tool_error", f"internal error {type(exc).__name__} at line {frame.lineno}")
     finish(receipt)
-    out = Path(args.out) if args.out else Path(os.environ.get("RUNNER_TEMP") or ".") / "security-gate"
+    out = Path(args.out) if args.out else Path(os.getenv("RUNNER_TEMP") or ".") / "security-gate"
     try:
         out.mkdir(parents=True, exist_ok=True)
         data = json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
@@ -3325,6 +3331,253 @@ def cmd_protected_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+# P-A, the Actions policy of a public repository (human.sh actions-policy).
+# GitHub blocks pull_request_target by default in a public repository that has
+# no applicable Actions event policy (docs/contracts/actions-policy.md). P-A is
+# that policy for the owned workflow and for nothing else: it targets the one
+# path WORKFLOW_PATH and lets that workflow run on pull_request_target only.
+# It never names another workflow and never allows another event. human.sh
+# reads the repository's policies from GitHub and asks this code what to do;
+# the answer from GitHub is read as data, and nothing here calls anything.
+#
+# GitHub's list of policies gives a summary of each one: id, name, source and
+# enforcement, without conditions and rules (REST docs, "List repository
+# Actions policies"). So human.sh also reads every listed policy by id, and a
+# policy is judged only from that detailed answer. An active policy that
+# GitHub does not show by id (404, as it may for one set above the
+# repository), or whose answer has no rules, may stop the gate: "blocked".
+POLICY_NAME = "security-gate: pull_request_target only for security-gate.yml"
+POLICY_SOURCE = "Repository"
+# Enforcement levels under which a policy stops nothing; any other value, a
+# missing one included, may block.
+POLICY_IDLE = ("evaluate", "disabled")
+# Patterns of workflow_path that this code reads: literal characters and the
+# wildcards * (not across /) and ** (across /). Anything else, ? and + among
+# them, may mean something else on GitHub, so such a pattern may match.
+_POLICY_GLOB_RE = re.compile(r"[A-Za-z0-9._/*-]+")
+
+
+def policy_body() -> dict:
+    """The request body of P-A, the same for creating and for updating it."""
+    return {"name": POLICY_NAME, "enforcement": "active",
+            "conditions": {"workflow_path": {"include": [WORKFLOW_PATH], "exclude": []}},
+            "rules": [{"type": "restrict_action_events", "parameters": {"allowed_events": [EVENT]}}]}
+
+
+def _glob_matches(pattern: object, path: str) -> bool | None:
+    """Whether a workflow_path pattern matches path; None when it may."""
+    if pattern == "~ALL":
+        return True
+    if not isinstance(pattern, str) or not _POLICY_GLOB_RE.fullmatch(pattern):
+        return None
+    rx = re.escape(pattern).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+    return re.fullmatch(rx, path) is not None
+
+
+def _any_of(values: list[bool | None]) -> bool | None:
+    return True if True in values else None if None in values else False
+
+
+def policy_reaches(policy: dict, path: str) -> bool | None:
+    """Whether the conditions of a policy reach the workflow at path: True,
+    False, or None when they may."""
+    conditions = policy.get("conditions") or {}
+    if not isinstance(conditions, dict) or set(conditions) - {"workflow_path"}:
+        return None
+    paths = conditions.get("workflow_path") or {}
+    if not isinstance(paths, dict):
+        return None
+    include, exclude = paths.get("include") or [], paths.get("exclude") or []
+    if not isinstance(include, list) or not isinstance(exclude, list):
+        return None
+    included = True if not include else _any_of([_glob_matches(p, path) for p in include])
+    excluded = _any_of([_glob_matches(p, path) for p in exclude])
+    if included is False or excluded is True:
+        return False
+    return True if included and excluded is False else None
+
+
+def policy_reaches_others(policy: dict) -> bool:
+    """Whether a policy may reach a workflow other than the owned one."""
+    conditions = policy.get("conditions") or {}
+    paths = conditions.get("workflow_path") if isinstance(conditions, dict) else None
+    return not isinstance(paths, dict) or paths.get("include") != [WORKFLOW_PATH]
+
+
+def _allowed_events(rule: object) -> list | None:
+    params = rule.get("parameters") if isinstance(rule, dict) else None
+    events = params.get("allowed_events") if isinstance(params, dict) else None
+    return events if isinstance(events, list) else None
+
+
+def policy_differences(policy: dict, *, name: bool) -> list[str]:
+    """How a policy as GitHub returns it differs from P-A (the name only if
+    name is set), one line per field, values as ASCII JSON."""
+    want = policy_body()
+    keys = ("name", "enforcement", "conditions", "rules") if name else ("enforcement", "conditions", "rules")
+    out = [f"{key} is {json.dumps(policy.get(key), sort_keys=True)}" for key in keys if policy.get(key) != want[key]]
+    for key, value in (("source_type", POLICY_SOURCE), ("target", "actions")):
+        if key in policy and policy[key] != value:
+            out.append(f"{key} is {json.dumps(policy[key], sort_keys=True)}")
+    return out
+
+
+def _check_policy(policy: object) -> dict:
+    if not isinstance(policy, dict) or type(policy.get("id")) is not int or policy["id"] < 1 \
+            or not isinstance(policy.get("name"), str):
+        raise ValueError("an Actions policy without an id or a name")
+    return policy
+
+
+def _policy_label(policy: dict) -> str:
+    return (f"#{policy['id']} {shown(policy['name'])} (source {json.dumps(policy.get('source_type'))}, "
+            f"enforcement {json.dumps(policy.get('enforcement'))})")
+
+
+def _policy_list(doc: object) -> list[dict]:
+    """The policies of a list answer (GET /repos/{owner}/{repo}/actions/policies,
+    one page), each a summary: id, name, source, enforcement."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("policies"), list) \
+            or type(doc.get("total_count")) is not int:
+        raise ValueError("not a list of Actions policies")
+    policies = [_check_policy(p) for p in doc["policies"]]
+    if doc["total_count"] != len(policies):
+        raise ValueError(f"the answer lists {len(policies)} of {doc['total_count']} policies; "
+                         "more than one page is not read")
+    ids = [p["id"] for p in policies]
+    if len(set(ids)) != len(ids):
+        raise ValueError("the answer lists a policy twice")
+    return policies
+
+
+def policy_ids(doc: object) -> list[int]:
+    """The ids of a list answer, in its order: human.sh reads each one by id."""
+    return [p["id"] for p in _policy_list(doc)]
+
+
+def _read_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc.strerror}") from exc
+
+
+def read_policy_details(directory: Path, ids: list[int]) -> dict[int, object]:
+    """The answers of GET /repos/{owner}/{repo}/actions/policies/{id} that
+    human.sh saved in directory, by id: <id>.json, or an empty <id>.404 when
+    GitHub answered 404 (then None). Exactly one of the two for each id."""
+    details: dict[int, object] = {}
+    for policy_id in ids:
+        found, missing = directory / f"{policy_id}.json", directory / f"{policy_id}.404"
+        if found.is_file() == missing.is_file():
+            raise ValueError(f"policy #{policy_id} has not been read by id")
+        details[policy_id] = None if missing.is_file() else _read_json(found)
+    return details
+
+
+def policy_report(doc: object, details: dict[int, object]) -> list[str]:
+    """What human.sh does with the repository's policies: doc is the list
+    answer (GET /repos/{owner}/{repo}/actions/policies, one page), details
+    the answer of GET .../actions/policies/{id} for each listed id, None where
+    GitHub answered 404. A policy is judged from its detailed answer only.
+    The first line says what to do:
+
+    state=absent     no P-A: create it
+    state=differs    the policy named POLICY_NAME is not P-A: update it
+    state=correct    P-A is in place (under its name or another): nothing
+    state=ambiguous  several repository policies have the name of P-A
+    state=blocked    another active policy may stop the owned workflow on
+                     pull_request_target; P-A cannot lift that
+
+    then policy=<id> (empty without one), and lines "differs:", "blocks:"
+    and "note:". Only a policy of the repository itself is ever P-A; one of
+    an organization or enterprise is someone else's."""
+    policies: list[dict] = []
+    blocks: list[str] = []
+    for entry in _policy_list(doc):
+        if entry["id"] not in details:
+            raise ValueError(f"policy #{entry['id']} has not been read by id")
+        detail = details[entry["id"]]
+        if detail is None:
+            if entry.get("source_type") == POLICY_SOURCE:
+                raise ValueError(f"policy #{entry['id']} of the repository is listed, but GitHub does not find "
+                                 "it by id; run again")
+            if entry.get("enforcement") not in POLICY_IDLE:
+                blocks.append(f"blocks:  {_policy_label(entry)} cannot be read by id (HTTP 404): its conditions "
+                              f"and rules are unknown, so it may stop {WORKFLOW_PATH}")
+            continue
+        if _check_policy(detail)["id"] != entry["id"]:
+            raise ValueError(f"GitHub answered for policy #{entry['id']} with policy #{detail['id']}")
+        policies.append(dict(entry, **detail))
+    own = [p for p in policies if p.get("source_type") == POLICY_SOURCE]
+    named = [p for p in own if p["name"] == POLICY_NAME]
+    same = [p for p in own if not policy_differences(p, name=False)]
+    lines: list[str] = []
+    for policy in policies:
+        if any(policy is p for p in named + same) or policy.get("enforcement") in POLICY_IDLE:
+            continue  # P-A itself; an evaluate or disabled policy blocks nothing
+        label, reach = _policy_label(policy), policy_reaches(policy, WORKFLOW_PATH)
+        rules = policy.get("rules")
+        if not isinstance(rules, list):
+            if reach is not False:
+                blocks.append(f"blocks:  {label} {'reaches' if reach else 'may reach'} {WORKFLOW_PATH}, and "
+                              "GitHub's answer shows no rules of it, so it may stop it")
+            continue
+        for rule in rules:
+            kind = rule.get("type") if isinstance(rule, dict) else None
+            events = _allowed_events(rule)
+            if kind == "restrict_action_events" and events is not None and EVENT in events:
+                if policy_reaches_others(policy):
+                    lines.append(f"note:  {label} also lets other workflows run on {EVENT}; this script does "
+                                 "not change it")
+            elif reach is False:
+                continue
+            elif kind == "restrict_action_events":
+                blocks.append(f"blocks:  {label} {'reaches' if reach else 'may reach'} {WORKFLOW_PATH} and does "
+                              f"not allow {EVENT}")
+            elif kind == "restrict_actions_actors":
+                lines.append(f"note:  {label} limits who can start {WORKFLOW_PATH}: pull requests of anyone else "
+                             "get no gate run and stay blocked")
+            else:
+                lines.append(f"note:  {label} has a rule this version does not know ({json.dumps(kind)}); it "
+                             f"may stop {WORKFLOW_PATH}")
+    if blocks:
+        state, policy_id = "blocked", ""
+    elif len(named) > 1:
+        state, policy_id = "ambiguous", ""
+        lines += [f"note:  {_policy_label(p)} has the name of P-A" for p in named]
+    elif named:
+        diffs = policy_differences(named[0], name=False)
+        state, policy_id = ("differs" if diffs else "correct"), str(named[0]["id"])
+        lines = [f"differs:  {d}" for d in diffs] + lines
+    elif same:
+        state, policy_id = "correct", str(same[0]["id"])
+        lines.append(f"note:  {_policy_label(same[0])} is P-A under another name")
+    else:
+        state, policy_id = "absent", ""
+    return [f"state={state}", f"policy={policy_id}", *blocks, *lines]
+
+
+def cmd_actions_policy(args: argparse.Namespace) -> int:
+    if (args.details is None) != (args.list is None):
+        raise ValueError("--list and --details go together")
+    if args.body:
+        print(json.dumps(policy_body(), indent=2))
+        return 0
+    doc = _read_json(next(p for p in (args.ids, args.list, args.policy) if p is not None))
+    if args.ids is not None:
+        lines = [str(policy_id) for policy_id in policy_ids(doc)]
+    elif args.list is not None:
+        lines = policy_report(doc, read_policy_details(args.details, policy_ids(doc)))
+    else:
+        diffs = policy_differences(_check_policy(doc), name=True)
+        lines = [f"state={'differs' if diffs else 'correct'}", f"policy={doc['id']}",
+                 *[f"differs:  {d}" for d in diffs]]
+    for line in lines:
+        print(line)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     if sys.version_info < (3, 11):  # noqa: UP036 - the guard is for an interpreter older than the target
         print("security-gate: INCONCLUSIVE - Python 3.11 or newer is required")
@@ -3343,11 +3596,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--default", required=True, help="tip of the default branch")
     p.add_argument("--head", required=True)
     p.add_argument("--patch", action="store_true", help="also print the patch, control characters escaped")
+    p = sub.add_parser("actions-policy", help="P-A, the Actions policy of a public repository (human.sh)")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--body", action="store_true", help="print the request body of P-A")
+    mode.add_argument("--ids", type=Path, help="print the ids of a list of policies (GET .../actions/policies)")
+    mode.add_argument("--list", type=Path, help="judge the repository's policies (GET .../actions/policies)")
+    mode.add_argument("--policy", type=Path, help="judge one policy as GitHub returned it")
+    p.add_argument("--details", type=Path, help="with --list: the policies read by id (<id>.json, <id>.404)")
     args = parser.parse_args(argv)
     if args.command == "pr":
         return cmd_pr(args)
+    commands = {"fingerprint": cmd_fingerprint, "protected-diff": cmd_protected_diff,
+                "actions-policy": cmd_actions_policy}
     try:
-        return cmd_fingerprint(args) if args.command == "fingerprint" else cmd_protected_diff(args)
+        return commands[args.command](args)
     except (GitError, UnicodeDecodeError, ValueError) as exc:
         print(f"gate.py: error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT[INCONCLUSIVE]
