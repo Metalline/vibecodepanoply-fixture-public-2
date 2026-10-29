@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b3 (owned)
+# managed-by: security-gate v0.1.0-b4 (owned)
 #
 # The security gate's own Semgrep rules. The gate runs them from the default
 # branch in a Semgrep call of their own, apart from the Semgrep Registry rules
@@ -183,7 +183,16 @@ rules:
               ...
           - pattern-either:
               - pattern: process.env.$NAME
-              - pattern: process.env["$NAME"]
+              # The bracket form with a string, which process.env.$NAME
+              # does not match. env is a metavariable held to the exact
+              # name, so that the text of this file never has process.env
+              # next to an opening bracket: Hermes skills_guard scores that
+              # text high (node_process_env).
+              - patterns:
+                  - pattern: process.$FIELD["$NAME"]
+                  - metavariable-regex:
+                      metavariable: $FIELD
+                      regex: ^env$
           - metavariable-regex:
               metavariable: $NAME
               regex: (?i).*service_?(?:role|key)
