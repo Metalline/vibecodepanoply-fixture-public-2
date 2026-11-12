@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b4 (owned)
+# managed-by: security-gate v0.1.0-b6 (owned)
 """security-gate: the pull request gate. Standard library only, Python 3.11+.
 
 The owned workflow .github/workflows/security-gate.yml runs this file from a
@@ -36,9 +36,10 @@ The verdict of this version:
   outside the protected set;
 - gate-integrity, the built-in rules: the drill canary, symlinks that dangle
   or point outside the repository, submodules and Git LFS pointers (content
-  not in the repository, not scanned), and scanner configuration or ignore
-  files, which the scanners below never read. Two canaries planted by the gate
-  itself prove that the rules saw the tree;
+  not in the repository, not scanned), scanner configuration or ignore files,
+  which the scanners below never read, and tables that Supabase migrations
+  leave open (row level security). Three canaries planted by the gate itself
+  prove that the rules saw the tree;
 - the scanners pinned in .security-gate/lock.json (taken from the default
   branch, or from the head once SG-TRUST-001 passed; from the default branch
   again when a confirmed new gate.py that declares a lock.json schema this
@@ -62,11 +63,18 @@ Subcommands for human.sh:
     gate.py fingerprint --repo DIR --commit REV
     gate.py protected-diff --repo DIR --default REV --head REV [--patch]
     gate.py actions-policy --body | --ids FILE | --list FILE --details DIR | --policy FILE
+    gate.py ruleset --body | --tree --repo DIR --commit REV | --runs FILE
+        | --check-ids FILE | --run-ids FILE --jobs DIR
+        | --checks FILE --status FILE --head SHA --jobs DIR --job-runs DIR
+        | --ids FILE | --list FILE --details DIR --default NAME
+        | --one FILE --default NAME
+        | --applies FILE --id N
 """
 from __future__ import annotations
 
 import argparse
 import ast
+import codecs
 import datetime
 import hashlib
 import io
@@ -82,7 +90,6 @@ import sys
 import tempfile
 import threading
 import time
-import tokenize
 import traceback
 import unicodedata
 import zipfile
@@ -90,7 +97,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GATE_VERSION = "0.1.0-b4"
+# First of all: _PAIR below has possessive quantifiers, and re of Python 3.10
+# cannot compile them. sv.py has its own check before it loads this file.
+if __name__ == "__main__" and sys.version_info < (3, 11):
+    print("security-gate: INCONCLUSIVE - Python 3.11 or newer is required")
+    sys.exit(2)  # EXIT[INCONCLUSIVE]
+
+GATE_VERSION = "0.1.0-b6"
 RECEIPT_SCHEMA = "security-gate/receipt"
 RECEIPT_SCHEMA_VERSION = 4
 FINGERPRINT_SCHEMA = "security-gate/fingerprint"
@@ -127,7 +140,22 @@ FILE_MODES = frozenset({"100644", "100755"})
 
 PASS, FAIL, INCONCLUSIVE = "pass", "fail", "inconclusive"
 EXIT = {PASS: 0, FAIL: 1, INCONCLUSIVE: 2}
-FAIL_CODES = frozenset({"finding", "exception_expired"})
+# Every reason code of a receipt, once, with the outcome it gives a run: the
+# table of reason codes of docs/contracts/gate-receipt.md. The gate gives a
+# code only through this table: each line that names one calls reason(),
+# add_reason() and tool_receipt() call it on whatever reaches them, and
+# finish() takes out one written past them, so a code that is not here never
+# reaches a receipt (tests/gate_ratchet.py). Nothing gives exception_expired
+# until P8 reads exceptions.yaml.
+REASONS = {
+    "finding": FAIL, "exception_expired": FAIL, "canary_missed": INCONCLUSIVE, "zero_scanned": INCONCLUSIVE,
+    "coverage_gap": INCONCLUSIVE, "tool_error": INCONCLUSIVE, "tool_missing": INCONCLUSIVE,
+    "artifact_mismatch": INCONCLUSIVE, "offline_db": INCONCLUSIVE, "unexpected_manifest": INCONCLUSIVE,
+    "unpinned_requirements": INCONCLUSIVE, "protected_change_unconfirmed": INCONCLUSIVE,
+    "self_check_failed": INCONCLUSIVE, "timeout": INCONCLUSIVE, "invalid_document": INCONCLUSIVE,
+    "unknown_schema_version": INCONCLUSIVE, "non_utf8_path": INCONCLUSIVE, "unsupported_object_format": INCONCLUSIVE,
+}
+FAIL_CODES = frozenset(code for code, outcome in REASONS.items() if outcome == FAIL)
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
@@ -153,6 +181,11 @@ RULES = (
     ("security-gate-lfs", "medium", "Git LFS pointer: the content is not in this repository and is not scanned"),
     ("security-gate-scanner-config", "medium",
      "scanner configuration or ignore file: the gate does not read it and it suppresses nothing; remove it"),
+    ("security-gate-supabase-rls", "high", ("table of public that the Supabase migrations leave without row level "
+     "security, so the anon key reads and changes it: add a migration with ALTER TABLE ... ENABLE ROW LEVEL SECURITY "
+     "and policies (if the dashboard enabled it, that migration changes nothing)")),
+    ("security-gate-supabase-open-policy", "high", ("policy that lets PUBLIC or anon change every row (FOR ALL or DELETE "
+     "USING (true), or FOR UPDATE USING (true) without WITH CHECK or with WITH CHECK (true)): limit it to the rows of the user")),
 )
 SEVERITY = {rule: sev for rule, sev, _ in RULES}
 
@@ -164,6 +197,7 @@ LFS_MAX_POINTER = 1024
 
 MAX_ITEMS = 500
 MAX_SHOWN = 20
+MAX_MADE_UP = 100
 MAX_PATHS = 50
 CHUNK = 1 << 20
 MAX_LINK_TARGET = 4096
@@ -173,6 +207,29 @@ MAX_SCANNED_FILE = 128 << 20
 MAX_RECORD = 4 << 20
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+class ReasonError(Exception):
+    """A code outside REASONS was given: a bug of the gate, never a reason of
+    the receipt. cmd_pr takes it, like any crash, for a tool_error."""
+
+
+def is_reason(code: object) -> bool:
+    return isinstance(code, str) and code in REASONS
+
+
+def made_up(code: object) -> str:
+    """What the log says of a code outside REASONS; the receipt never has it."""
+    return f"a reason code outside REASONS: {shown(str(code)[:MAX_MADE_UP])}"
+
+
+def reason(code: str) -> str:
+    """A reason code of REASONS, as given; anything else raises where it is
+    given, a code built at run time too, so a receipt never has a made-up
+    code."""
+    if not is_reason(code):
+        raise ReasonError(made_up(code))
+    return code
 
 
 def sha256_hex(data: bytes) -> str:
@@ -210,8 +267,8 @@ def is_protected(path: str) -> bool:
     return any(low == d or low.startswith(d + "/") or d.startswith(low + "/") for d in PROTECTED_DIRS)
 
 
-def listed(paths: list[str]) -> str:
-    return ", ".join(shown(p) for p in paths[:MAX_SHOWN]) + (" ..." if len(paths) > MAX_SHOWN else "")
+def listed(paths: list[str], end: str = "") -> str:
+    return ", ".join(shown(p) for p in paths[:MAX_SHOWN]) + (" ..." if len(paths) > MAX_SHOWN else end)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +304,41 @@ class Blob:
     canary_lines: list[int] = field(default_factory=list)
     head: bytes = b""
     nul: bool = False   # a NUL byte anywhere: git's "binary"
+    data: bytes = b""
+
+
+class BlobReader:
+    """A Blob from the bytes of a blob as they stream past, in chunks of any
+    size: its sha256, the line numbers of canaries and the first bytes (for
+    symlink targets)."""
+
+    def __init__(self, size: int) -> None:
+        self.blob, self.digest = Blob(size=size), hashlib.sha256()
+        self.tail, self.nl_before = b"", 0
+
+    def feed(self, chunk: bytes) -> None:
+        blob = self.blob
+        self.digest.update(chunk)
+        blob.nul = blob.nul or b"\0" in chunk
+        if len(blob.head) < MAX_LINK_TARGET + 1:
+            blob.head += chunk[:MAX_LINK_TARGET + 1 - len(blob.head)]
+        buf = self.tail + chunk
+        for m in CANARY_RE.finditer(buf):
+            blob.canary_lines.append(1 + self.nl_before + buf.count(b"\n", 0, m.start()))
+        cut = max(0, len(buf) - (CANARY_LEN - 1))
+        self.nl_before += buf.count(b"\n", 0, cut)
+        self.tail = buf[cut:]
+
+    def done(self) -> Blob:
+        self.blob.sha256 = "sha256:" + self.digest.hexdigest()
+        return self.blob
+
+
+def blob_of(data: bytes) -> Blob:
+    """The Blob of bytes in memory, as Git.blobs reads one from a stream."""
+    reader = BlobReader(len(data))
+    reader.feed(data)
+    return reader.done()
 
 
 @dataclass(frozen=True)
@@ -464,9 +556,10 @@ class Git:
         return self.run("diff", "--no-color", "--text", "--no-ext-diff", "--no-textconv", "--no-renames",
                         a, b, "--", *paths)
 
-    def blobs(self, oids: list[str]) -> dict[str, Blob]:
+    def blobs(self, oids: list[str], whole: bool = False) -> dict[str, Blob]:
         """Stream every blob once through cat-file --batch: size, sha256, the
-        line numbers of canaries, and the first bytes (for symlink targets)."""
+        line numbers of canaries, the first bytes (for symlink targets) and,
+        if whole, all of them."""
         result: dict[str, Blob] = {}
         if not oids:
             return result
@@ -488,30 +581,19 @@ class Git:
                 header = proc.stdout.readline().split()
                 if len(header) != 3 or header[0].decode() != oid or header[1] != b"blob":
                     raise GitError("cat-file did not return the requested blob")
-                size = int(header[2])
-                blob = Blob(size=size)
-                digest = hashlib.sha256()
-                remaining = size
-                tail, nl_before = b"", 0
+                remaining = int(header[2])
+                reader, parts = BlobReader(remaining), []
                 while remaining:
                     chunk = proc.stdout.read(min(CHUNK, remaining))
                     if not chunk:
                         raise GitError("cat-file output ended early")
                     remaining -= len(chunk)
-                    digest.update(chunk)
-                    blob.nul = blob.nul or b"\0" in chunk
-                    if len(blob.head) < MAX_LINK_TARGET + 1:
-                        blob.head += chunk[:MAX_LINK_TARGET + 1 - len(blob.head)]
-                    buf = tail + chunk
-                    for m in CANARY_RE.finditer(buf):
-                        blob.canary_lines.append(1 + nl_before + buf.count(b"\n", 0, m.start()))
-                    cut = max(0, len(buf) - (CANARY_LEN - 1))
-                    nl_before += buf.count(b"\n", 0, cut)
-                    tail = buf[cut:]
+                    reader.feed(chunk)
+                    parts += [chunk] if whole else []
                 if proc.stdout.read(1) != b"\n":
                     raise GitError("cat-file output is not terminated")
-                blob.sha256 = "sha256:" + digest.hexdigest()
-                result[oid] = blob
+                result[oid] = reader.done()
+                result[oid].data = b"".join(parts)
         finally:
             proc.stdout.close()
             code = proc.wait(timeout=600)
@@ -523,7 +605,7 @@ class Git:
     def write_blobs(self, pairs: list[tuple[str, Path]]) -> list[Path]:
         """Write each blob to its new file through one cat-file --batch.
         Returns the files that could not be created (an existing file of the
-        same name, which only a case-insensitive file system produces)."""
+        same name, which only a file system that merges names produces)."""
         failed: list[Path] = []
         if not pairs:
             return failed
@@ -706,7 +788,7 @@ REGISTRY_POLICIES = ("signal", "block")
 
 
 class LockError(Exception):
-    def __init__(self, detail: str, code: str = "invalid_document") -> None:
+    def __init__(self, detail: str, code: str = reason("invalid_document")) -> None:
         super().__init__(detail)
         self.code = code
 
@@ -735,7 +817,7 @@ def parse_lock(data: bytes) -> dict:
     version = doc.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool) or version not in LOCK_SCHEMA_VERSIONS:
         raise LockError("lock.json: schema_version is not one of " + ", ".join(map(str, LOCK_SCHEMA_VERSIONS)),
-                        "unknown_schema_version")
+                        reason("unknown_schema_version"))
     names = LOCK_TOOLS[version]
     tools = doc.get("tools")
     _need(isinstance(tools, dict) and set(tools) == set(names), "tools",
@@ -804,14 +886,14 @@ def load_lock(git: Git, commit: str) -> tuple[dict | None, bytes | None, tuple[s
     object."""
     entry = git.entry_at(commit, LOCK_PATH)
     if entry is None:
-        return None, None, ("invalid_document", f"{LOCK_PATH} is missing, so no scanner can run")
+        return None, None, (reason("invalid_document"), f"{LOCK_PATH} is missing, so no scanner can run")
     mode, kind, oid = entry
     if kind != "blob" or mode not in FILE_MODES:
-        return None, None, ("invalid_document", f"{LOCK_PATH} is not a regular file")
+        return None, None, (reason("invalid_document"), f"{LOCK_PATH} is not a regular file")
     try:
         data = git.blob_bytes(oid, MAX_LOCK_BYTES)
     except GitError as exc:
-        return None, None, ("invalid_document", f"{LOCK_PATH}: {exc}")
+        return None, None, (reason("invalid_document"), f"{LOCK_PATH}: {exc}")
     try:
         return parse_lock(data), data, None
     except LockError as exc:
@@ -1015,19 +1097,19 @@ def prepare(s: Scan, name: str) -> tuple[str | None, list[tuple[str, str]]]:
     """(version reported by the image, problems). The image is pulled by
     digest, and the version it reports must be the one lock.json names."""
     if s.lock is None:
-        return None, [("tool_missing", f"{name} did not run: {LOCK_PATH} is missing or invalid")]
+        return None, [(reason("tool_missing"), f"{name} did not run: {LOCK_PATH} is missing or invalid")]
     ref = s.ref(name)
     problem = s.docker.pull(ref)
     if problem:
-        return None, [("tool_missing", f"{name} did not run: {problem}")]
+        return None, [(reason("tool_missing"), f"{name} did not run: {problem}")]
     run = s.docker.run(ref, _VERSION_ARGS[name], timeout=120)
     m = _VERSION_OUT[name].search(run.out.decode("utf-8", "replace")) if run.code == 0 else None
     if not m:
-        return None, [("tool_error", f"{name} did not report its version (exit {run.code})")]
+        return None, [(reason("tool_error"), f"{name} did not report its version (exit {run.code})")]
     version = m.group(1).removeprefix("v")
     if version != s.spec(name)["version"]:
         detail = f"{name} reports version {shown(version)}, lock.json names {s.spec(name)['version']}"
-        return version, [("artifact_mismatch", detail)]
+        return version, [(reason("artifact_mismatch"), detail)]
     return version, []
 
 
@@ -1061,13 +1143,13 @@ def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *,
     if items:
         shown_items = listing or ("; ".join(f"{i['rule']} {shown(i['path'])}" + (f":{i['line']}" if i["line"] else "")
                                             for i in items[:MAX_SHOWN]) + (" ..." if len(items) > MAX_SHOWN else ""))
-        reasons.append(("finding", f"{len(items)} finding(s) at or above {s.spec(name)['policy']['min_severity']}: "
-                                   + shown_items))
+        reasons.append((reason("finding"), f"{len(items)} finding(s) at or above {s.spec(name)['policy']['min_severity']}: "
+                                           + shown_items))
     reasons += problems
     if items:
-        outcome, code = FAIL, "finding"
+        outcome, code = FAIL, reason("finding")
     elif problems:
-        outcome, code = INCONCLUSIVE, problems[0][0]
+        outcome, code = INCONCLUSIVE, reason(problems[0][0])
     else:
         outcome, code = PASS, None
     receipt = {
@@ -1100,11 +1182,11 @@ def tool_receipt(s: Scan, name: str, version: str, argv: list[str], run: Run, *,
 
 def run_problem(name: str, run: Run, ok: tuple[int, ...]) -> list[tuple[str, str]]:
     if run.timed_out:
-        return [("timeout", f"{name} {run.detail}")]
+        return [(reason("timeout"), f"{name} {run.detail}")]
     if run.code is None:
-        return [("tool_error", f"{name}: {run.detail}")]
+        return [(reason("tool_error"), f"{name}: {run.detail}")]
     if run.code not in ok:
-        return [("tool_error", f"{name} exited {run.code}, which is a failure, not a finding")]
+        return [(reason("tool_error"), f"{name} exited {run.code}, which is a failure, not a finding")]
     return []
 
 
@@ -1143,6 +1225,172 @@ def resolve_link(path: str, target: bytes, links: dict[str, bytes], names: set[s
     return "ok" if final == "" or final in names or final in dirs else "dangling"
 
 
+# Supabase migrations: ADR 0006, item 53.
+SUPABASE_MIGRATION = re.compile(r"(?:^|/)supabase/migrations/[0-9]+_[^/]*\.sql$")
+SUPABASE_CANARY = "\0canary/supabase/migrations/0_.sql"   # NUL: in no git path, its own chain
+_U = r"\x80-\U0010ffff"   # Postgres: a byte above 0x7f is a letter
+_SQL = re.compile(rf"""[ \t\n\r\f\v]+|--[^\r\n]*|(?P<c>/\*)|(?P<s>[Ee]'[^'\\]*(?:(?:\\.|'')[^'\\]*)*'(?!(?:\s|--[^\r\n]*+)*')|'[^']*(?:''[^']*)*')
+    |"(?P<q>[^"]*(?:""[^"]*)*)"|(?P<bad>[Ee]'|['"])|(?P<w>[A-Za-z_{_U}][\w${_U}]*)|(?P<d>\$(?:[A-Za-z_{_U}][\w{_U}]*)?\$)
+    |(?P<p>.)""", re.DOTALL | re.VERBOSE)
+_ASCII_LOWER = {c: c + 32 for c in range(65, 91)}
+_SQL_KEPT = ("create", "alter", "drop", "do", "set")
+# A statement: lower-case words one space apart; "n", 'n', $n$: the n-th held name, string, body.
+_N = r'(?:[\w$]+|"\d+")(?: \. (?:[\w$]+|"\d+"))*'
+_SQL_RUNS = re.compile(
+    rf"create (?P<temp>(?:(?:global|local|temp|temporary|unlogged) )*)table (?:if not exists )?(?P<create>{_N})(?: .*)?"
+    rf"|alter table (?:if exists )?(?:only )?(?P<alter>{_N})(?P<actions> .*)?|drop table (?:if exists )?(?P<drop>{_N}(?: , {_N})*)(?: .*)?"
+    rf"|drop policy (?:if exists )?(?P<dropped>\S+) on (?P<off>{_N})(?: .*)?"
+    rf"|(?P<policy>create|alter) policy (?P<name>\S+) on (?P<on>{_N})(?: rename to (?P<rename>\S+))?(?: as (?P<as>\w+))?"
+    rf"(?: for (?P<for>\w+))?(?: to (?P<to>{_N}(?: , {_N})*))?(?: using (?P<using>.*?))?(?: with check (?P<check>.*))?"
+    rf"|set (?:session |local )?(?:search_path (?:to|=)|schema) (?P<path>.*)|do (?:.*? )?\$(?P<do>\d+)\$(?: .*)?")
+_SQL_ACTION = re.compile(rf"\b(enable|disable) row level security\b|\b(?:rename to|set (schema)) ({_N})")
+# A loop of EXECUTE that enables: over pg_tables of public, ending a DO body.
+_SQL_LOOP = re.compile(r"for (\S+) in (?:\( )?select (?:(tablename)|\*|schemaname , tablename) from pg_tables where schemaname = "
+    r"'(\d+)' (?:\) )?loop (?:raise notice [^;]* ; )*(?:(?!\1 )([\w$]+) : = |execute )format \( '(\d+)' , "
+    r"\1(?(2)(?: \. tablename)?| \. (schemaname , \1 \. )?tablename) \) ; (?(4)execute \4 ; )end loop ; end$")
+
+
+def sql_statements(text: str, held: list, ln: int = 1, every: bool = False) -> tuple[list, str | None]:
+    """Statements and the lines of their words from ln (unless every, none of one not
+    of _SQL_KEPT) and why text is not read."""
+    out, words, lines, i, skip, last = [], [], [], 0, False, 0
+    while i < len(text):
+        m = _SQL.match(text, i)
+        kind, i = m.lastgroup, m.end()
+        if kind == "c":
+            depth = 1
+            for c in re.compile(r"/\*|\*/").finditer(text, i):
+                depth += 1 if c[0] == "/*" else -1
+                if not depth:
+                    i = c.end()
+                    break
+            else:
+                return out, "ends inside a /* comment"
+        elif kind == "bad":
+            return out, "has a quoted string or name the gate cannot read"
+        elif m[0] == ";":
+            out += [(" ".join(words), lines)] if words else [("", ())] * skip
+            words, lines, skip = [], [], False
+        elif kind:
+            skip = skip or not (words or every or m[0].translate(_ASCII_LOWER) in _SQL_KEPT)
+            v, part = m[kind], None
+            if kind == "d":
+                end = text.find(v, i)
+                if end < 0:
+                    return out, f"ends inside a {v} body"
+                v, part, i = f"${len(held)}$", (text[i:end], ln + text.count("\n", last, i)), end + len(v)
+            elif skip:
+                continue
+            elif kind in "qs":
+                v, part = f'"{len(held)}"' if kind == "q" else f"'{len(held)}'", v.replace('""', '"')
+            if not skip:
+                words.append(v.translate(_ASCII_LOWER))
+                ln += text.count("\n", last, last := m.start())
+                lines.append(ln)
+                held += [] if part is None else [part]
+    return out + ([(" ".join(words), lines)] if words else []), None
+
+
+def supabase_run(path: str, text: str, tables: dict, policies: dict, walked: list) -> str | None:
+    """Run a migration (DO bodies, not functions) on tables (schema, name): [on, path,
+    line], policies table: {name: [AS, FOR, TO, USING, WITH CHECK, path, line]}."""
+    held, schema = [], "public"
+    todo, why = sql_statements(text, held)
+    todo = todo[::-1] if not why else []
+
+    def key(name):   # Postgres keeps 63 bytes of a name
+        parts = [(held[int(p[1:-1])] if p[0] == '"' else p).encode()[:63].decode(errors="ignore") for p in name.split(" . ")]
+        return (parts[-2] if len(parts) > 1 else schema, parts[-1])
+
+    while todo:
+        st, lines, *nested = todo.pop()
+        if st is None:   # a DO body ends: EXECUTE of DISABLE, or _SQL_LOOP
+            j, t = " ; ".join(s for s, _ in nested[0]), " ".join(x if type(x) is str else x[0] for x in held[nested[1]:])
+            lp = _SQL_LOOP.search(j)
+            off = " execute " in f" {j} " and re.search(r"(?i)\bdisable\s+row\s+level\s+security", t)
+            on = lp and schema == "public" == held[int(lp[3])][1:-1] and re.fullmatch(r"(?ai)'alter\s+table\s+" + (
+                "(?-i:%I)\\." if lp[6] else r"(?:public\.)?") + r"(?-i:%I)\s+enable\s+row\s+level\s+security'", held[int(lp[5])])
+            walked[0] += len(tables) if off or on else 0
+            if walked[0] > 1 << 20:
+                return "has more DO blocks of EXECUTE than the gate follows"
+            for (sc, _), state in tables.items() if off or on else ():
+                state[:] = [False, path, lines[0]] if off else [state[0] or sc == "public", *state[1:]]
+            continue
+        if nested:   # after BEGIN, THEN, ELSE or LOOP
+            cut = re.match(r"(.*? )?(begin|then|else|loop) (?=(create|alter|drop|do|set) )", st)
+            lines, st = (lines[st[:cut.end()].count(" "):], st[cut.end():]) if cut else (lines, st)
+        m = _SQL_RUNS.fullmatch(st)
+        if not st or nested and not m and re.search(r"\b(reset|commit|rollback|set_config)\b", st):   # unread: it may RESET search_path
+            schema = "public"
+        if not m:
+            continue
+        k = key(m["create"] or m["alter"] or m["on"] or "_")
+        if m["create"] and not m["temp"].replace("unlogged ", ""):
+            tables.setdefault(k, [False, path, lines[0]])
+        elif m["alter"] and k in tables:
+            for a in _SQL_ACTION.finditer(m["actions"] or ""):
+                if a[1]:
+                    tables[k][:] = [True, *tables[k][1:]] if a[1] == "enable" else [False, path, lines[0]]
+                    continue
+                new = (key(a[3])[1], k[1]) if a[2] else (k[0], key(a[3])[1])
+                tables[new], policies[new] = tables.pop(k), policies.pop(k, {})
+                k = new
+        elif m["drop"]:
+            for name in m["drop"].split(" , "):
+                tables.pop(key(name), None)
+                policies.pop(key(name), None)
+        elif m["dropped"]:
+            policies.get(key(m["off"]), {}).pop(key(m["dropped"])[1], None)
+        elif m["policy"] and ((pn := key(m["name"])[1]) in (ps := policies.setdefault(k, {})) or m["policy"] == "create"):
+            old = ps.pop(pn) if m["policy"] == "alter" else [None] * 7
+            if m["rename"]:
+                ps[key(m["rename"])[1]] = old
+            else:
+                new = [m["as"], m["for"], m["to"] and {key(r)[1] for r in m["to"].split(" , ")}, m["using"], m["check"]]
+                ps[pn] = [n or o for n, o in zip(new, old, strict=False)] + [path, lines[0]]
+        elif m["path"]:
+            names = [held[int(p[1:-1])].strip("'") if re.fullmatch(r"['\"]\d+.", p) else p for p in m["path"].split(" , ")]
+            first = next((p for p in names if p != "$user"), schema)
+            schema = "public" if first == "default" or not re.fullmatch(r"[^\W\d][\w$]*", first) else first
+        elif m["do"]:
+            body, ln = held[int(m["do"])]
+            n, (inner, inner_why) = len(held), sql_statements(body, held, ln, True)
+            why = why or inner_why and f"{inner_why} of a DO block"
+            todo += [] if inner_why else [(None, lines, inner, n)] + [(s, o, True) for s, o in reversed(inner)]
+    return why
+
+
+def supabase_findings(files: dict[str, bytes]) -> tuple[list, list]:
+    """(rule, path, line) of each finding, (path, why) of each migration unread."""
+    chains = {}
+    for path in sorted(files):
+        if SUPABASE_MIGRATION.search(path):
+            chains.setdefault(path.rsplit("/", 1)[0], []).append(path)
+    found, gaps = [], []
+    for folder in sorted(chains):
+        tables, policies, walked, g = {}, {}, [0], len(gaps)
+        try:
+            for path in chains[folder]:
+                try:
+                    why = supabase_run(path, files[path].decode("utf-8-sig"), tables, policies, walked)
+                except UnicodeDecodeError:
+                    why = "is not UTF-8"
+                gaps += [(path, why)] if why else []
+            found += [("security-gate-supabase-rls", path, n) for (schema, _), (on, path, n) in sorted(tables.items())
+                      if not on and schema == "public"]
+            for table, ps in policies.items():
+                for kind, cmd, to, using, check, path, n in ps.values():
+                    true = [re.fullmatch(r"(\( )+true( \))+", e or "") and e.count("(") == e.count(")") for e in (using, check)]
+                    if tables.get(table, [False])[0] and table[0] == "public" and kind != "restrictive" \
+                            and (to or {"public"}) & {"public", "anon"} and true[0] \
+                            and ((cmd or "all") in ("all", "delete") or cmd == "update" and (true[1] or not check)):
+                        found.append(("security-gate-supabase-open-policy", path, n))
+        except Exception as e:  # noqa: BLE001 - a chain the gate fails on is unread, never pass
+            why = f"is in a chain the gate failed on (internal error {type(e).__name__} at line {traceback.extract_tb(e.__traceback__)[-1].lineno})"
+            gaps[g:] = [(p, why) for p in chains[folder]]
+    return sorted(found), gaps
+
+
 def finding(rule: str, path: str, line: int | None) -> dict:
     return {"rule": rule, "path": path, "line": line, "severity": SEVERITY[rule],
             "fingerprint": sha256_hex(canonical([rule, path, line]))}
@@ -1154,10 +1402,15 @@ def gate_integrity(s: Scan) -> dict:
     nonce = os.urandom(16).hex()
     canary_oid = git.write_blob(b"drill\n" + CANARY_PREFIX + nonce.encode() + b"\n")
     link_oid = git.write_blob(("security-gate-missing-" + nonce).encode())
-    planted = git.blobs([canary_oid, link_oid])
-
+    sql_oid = git.write_blob(f"create table t{nonce} ();".encode())
     files = [e for e in entries if e.kind == "blob" and not e.mode.startswith("120")]
     links = {e.path: blobs[e.oid].head for e in entries if e.kind == "blob" and e.mode.startswith("120")}
+    sql = [e for e in files if SUPABASE_MIGRATION.search(e.path)]
+    read = {e for e in sql if blobs[e.oid].size <= MAX_SCANNED_FILE}
+    planted = git.blobs(sorted({canary_oid, link_oid, sql_oid} | {e.oid for e in read}), whole=True)
+    rls, gaps = supabase_findings({SUPABASE_CANARY: planted[sql_oid].data, **{e.path: planted[e.oid].data for e in read}})
+    gaps += [(e.path, f"is larger than the {MAX_SCANNED_FILE} bytes the gate reads") for e in sql if e not in read]
+    gaps += [(p, "is a symbolic link") for p in links if re.search(r"(^|/)supabase(/migrations(/[0-9]+_[^/]*\.sql)?)?$", p)]
     names = {e.path for e in entries}
     dirs = {"/".join(e.path.split("/")[:i]) for e in entries for i in range(1, e.path.count("/") + 1)}
 
@@ -1179,31 +1432,37 @@ def gate_integrity(s: Scan) -> dict:
     for e in entries:
         if posixpath.basename(e.path).lower() in SCANNER_CONFIG_NAMES:
             items.append(finding("security-gate-scanner-config", e.path, None))
+    items += [finding(*f) for f in rls if f[1] != SUPABASE_CANARY]
 
     canary_path = "\0planted-link"   # NUL cannot occur in a git path: no clash
     canaries = [
         {"id": "gate-integrity-file", "expected_rule": CANARY_RULE, "found": bool(planted[canary_oid].canary_lines)},
         {"id": "gate-integrity-symlink", "expected_rule": "security-gate-symlink-dangling",
          "found": resolve_link(canary_path, planted[link_oid].head, links, names, dirs) == "dangling"},
+        {"id": "gate-integrity-supabase", "expected_rule": "security-gate-supabase-rls",
+         "found": ("security-gate-supabase-rls", SUPABASE_CANARY, 1) in rls},
     ]
     reasons = []
     if items:
-        outcome, code = FAIL, "finding"
+        outcome, code = FAIL, reason("finding")
         shown_items = "; ".join(i["rule"] + " " + shown(i["path"]) + (f":{i['line']}" if i["line"] else "")
                                 for i in items[:MAX_SHOWN])
-        reasons.append(("finding", f"{len(items)} finding(s): {shown_items}" + (" ..." if len(items) > MAX_SHOWN else "")))
+        reasons.append((reason("finding"), f"{len(items)} finding(s): {shown_items}" + (" ... " if len(items) > MAX_SHOWN else ". ")
+                        + ". ".join(f"{r}: {d}" for r, _, d in RULES if r in {i["rule"] for i in items})))
     else:
         outcome, code = PASS, None
     missed = [c["id"] for c in canaries if not c["found"]]
     if missed:
-        reasons.append(("canary_missed", "planted canaries not found: " + ", ".join(missed)))
+        reasons.append((reason("canary_missed"), "planted canaries not found: " + ", ".join(missed)))
+    reasons += [(reason("coverage_gap"), f"Supabase migration {shown(path)} {why}, so the gate did not check it")
+                for path, why in gaps]
     if not files:
-        reasons.append(("zero_scanned", "no regular file in the head tree"))
+        reasons.append((reason("zero_scanned"), "no regular file in the head tree"))
     if outcome == PASS and reasons:
-        outcome, code = INCONCLUSIVE, reasons[0][0]
+        outcome, code = INCONCLUSIVE, reason(reasons[0][0])
     rules_doc = [[rule, sev, desc] for rule, sev, desc in RULES] + [CANARY_PREFIX.decode(), CANARY_LEN,
                                                                      [p.decode() for p in LFS_PREFIXES], LFS_MAX_POINTER,
-                                                                     sorted(SCANNER_CONFIG_NAMES)]
+                                                                     sorted(SCANNER_CONFIG_NAMES), SUPABASE_MIGRATION.pattern]
     receipt = {
         "id": "gate-integrity",
         "name": "gate-integrity",
@@ -1229,7 +1488,8 @@ def gate_integrity(s: Scan) -> dict:
         "reason_code": code,
         "duration_s": int(time.monotonic() - start),
     }
-    return {"receipt": receipt, "reasons": reasons}
+    # items (the receipt holds MAX_ITEMS) and unread: plan's preview reads both.
+    return {"receipt": receipt, "reasons": reasons, "items": items, "unread": [path for path, _ in gaps]}
 
 
 # ---------------------------------------------------------------------------
@@ -1318,7 +1578,7 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
     problems: list[tuple[str, str]] = []
     markers = [m for m in ("ERR", "FTL") if re.search(rf"(?m)(?:^|\s){m}\s", stderr)]
     if markers:
-        problems.append(("tool_error", "gitleaks logged " + " and ".join(markers)
+        problems.append((reason("tool_error"), "gitleaks logged " + " and ".join(markers)
                          + ": a failing git call still prints \"no leaks found\" and exits 0"))
     found = _GITLEAKS_COMMITS.findall(stderr)
     commits = int(found[-1]) if found else None
@@ -1329,7 +1589,7 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
         except (UnicodeDecodeError, ValueError):
             data = None
     if not isinstance(data, list) or not all(isinstance(f, dict) for f in data):
-        problems.append(("tool_error", "gitleaks wrote no readable report"))
+        problems.append((reason("tool_error"), "gitleaks wrote no readable report"))
         data = []
     own, snapshot, copy = layout["dir"] + "/", layout["snapshot"], layout["copy"]
     files, changes = layout["files"], layout["changes"]
@@ -1340,7 +1600,7 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
     for f in data:
         rule, path, line, commit = f.get("RuleID"), f.get("File"), f.get("StartLine"), f.get("Commit")
         if not (isinstance(rule, str) and isinstance(path, str) and isinstance(commit, str)):
-            problems.append(("tool_error", "gitleaks reported a finding without rule, file or commit"))
+            problems.append((reason("tool_error"), "gitleaks reported a finding without rule, file or commit"))
             continue
         line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
         if path.startswith(own):
@@ -1361,10 +1621,10 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
                     merged.setdefault(key, set()).add(changes[n][2])
                     continue
             else:
-                problems.append(("tool_error", "gitleaks reported a file in the gate's own directory that it did not write"))
+                problems.append((reason("tool_error"), "gitleaks reported a file in the gate's own directory that it did not write"))
                 continue
         elif commit == copy:
-            problems.append(("tool_error", "gitleaks reported a file that is not in the gate's copy of the changes"))
+            problems.append((reason("tool_error"), "gitleaks reported a file that is not in the gate's copy of the changes"))
             continue
         else:
             where = "head" if commit == snapshot else commit
@@ -1386,17 +1646,17 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
         else:
             below += 1
     if code == 0 and data:
-        problems.append(("tool_error", "gitleaks exited 0 yet reported findings"))
+        problems.append((reason("tool_error"), "gitleaks exited 0 yet reported findings"))
     if code == 1 and not data:
-        problems.append(("tool_error", "gitleaks exited 1 yet reported no finding"))
+        problems.append((reason("tool_error"), "gitleaks exited 1 yet reported no finding"))
     if commits is None:
-        problems.append(("tool_error", "gitleaks did not report how many commits it scanned"))
+        problems.append((reason("tool_error"), "gitleaks did not report how many commits it scanned"))
     elif commits == 0:
-        problems.append(("zero_scanned", "gitleaks scanned 0 commits"))
+        problems.append((reason("zero_scanned"), "gitleaks scanned 0 commits"))
     elif commits != expected_commits:
-        problems.append(("coverage_gap", (f"gitleaks scanned {commits} commit(s) with added lines, expected "
-                                          f"{expected_commits}: {expected_commits - 2} of the pull request, the "
-                                          f"snapshot of its head tree and the copy of its changes")))
+        problems.append((reason("coverage_gap"), (f"gitleaks scanned {commits} commit(s) with added lines, expected "
+                                                  f"{expected_commits}: {expected_commits - 2} of the pull request, the "
+                                                  f"snapshot of its head tree and the copy of its changes")))
     # A canary counts only as a finding that fails under the policy, like the
     # canaries of osv-scanner: a threshold above every gitleaks finding would
     # turn gitleaks off while the canaries still looked found.
@@ -1405,12 +1665,12 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
                 {"id": "gitleaks-changes", "expected_rule": GITLEAKS_CANARY_RULE, "found": hits["changes"] and failing}]
     missed = [c["id"] for c in canaries if not c["found"]]
     if missed and not failing and any(hits.values()):
-        problems.append(("canary_missed", (f"gitleaks reported its canaries, but every gitleaks finding is "
-                                           f"{GITLEAKS_SEVERITY}, below min_severity {min_severity} of lock.json, so "
-                                           f"no secret could fail the gate")))
+        problems.append((reason("canary_missed"), (f"gitleaks reported its canaries, but every gitleaks finding is "
+                                                   f"{GITLEAKS_SEVERITY}, below min_severity {min_severity} of lock.json, so "
+                                                   f"no secret could fail the gate")))
     elif missed:
-        problems.append(("canary_missed", f"gitleaks did not report the {GITLEAKS_CANARY_RULE} canary of the gate: "
-                                          + ", ".join(missed)))
+        problems.append((reason("canary_missed"), f"gitleaks did not report the {GITLEAKS_CANARY_RULE} canary of the gate: "
+                                                  + ", ".join(missed)))
     return {"items": items, "below": below, "canaries": canaries, "markers": markers, "commits": commits,
             "problems": problems, "listing": gitleaks_listing(wheres)}
 
@@ -1428,9 +1688,9 @@ def gitleaks_listing(wheres: dict[tuple, set[str]]) -> str:
             f"only in {named}, not in the head tree"
         history = history or "head" not in found
         entries.append(f"{rule} {shown(path)}" + (f":{line}" if line else "") + f" ({where})")
-    text = "; ".join(entries[:MAX_SHOWN]) + (" ..." if len(entries) > MAX_SHOWN else "")
+    text = "; ".join(entries[:MAX_SHOWN]) + (" ..." if len(entries) > MAX_SHOWN else "." if history else "")
     if history:
-        text += (". A secret in a commit of the pull request stays in the branch even after the file is fixed: "
+        text += (" A secret in a commit of the pull request stays in the branch even after the file is fixed: "
                  "revoke the key, because GitHub keeps pushed commits readable, then rewrite the branch without it")
     return text
 
@@ -1452,10 +1712,10 @@ def gitleaks_readable(s: Scan, files: list[Entry], changes: list[Change]) -> tup
     problems = []
     if kinds:
         shown_kinds = "; ".join(f"{shown(p)} ({kinds[p]})" for p in sorted(kinds)[:MAX_SHOWN])
-        problems.append(("coverage_gap", (f"gitleaks cannot read {len(kinds)} file(s) that the pull request adds or "
-                                          f"changes, so their content is not scanned for secrets: {shown_kinds}"
-                                          + (" ..." if len(kinds) > MAX_SHOWN else "")
-                                          + ". Keep such content as plain text, or remove the file")))
+        problems.append((reason("coverage_gap"), (f"gitleaks cannot read {len(kinds)} file(s) that the pull request adds or "
+                                                  f"changes, so their content is not scanned for secrets: {shown_kinds}"
+                                                  + (" ..." if len(kinds) > MAX_SHOWN else ".")
+                                                  + " Keep such content as plain text, or remove the file")))
     return opaque, problems
 
 
@@ -1538,6 +1798,7 @@ LOCKFILES = {"package-lock.json": ("package-lock.json", "npm"), "npm-shrinkwrap.
              "bun.lock": ("bun.lock", "npm"), "uv.lock": ("uv.lock", "PyPI"), "poetry.lock": ("poetry.lock", "PyPI"),
              "Pipfile.lock": ("Pipfile.lock", "PyPI"), "pdm.lock": ("pdm.lock", "PyPI"),
              "pylock.toml": ("pylock.toml", "PyPI")}
+_LOCK_PARSERS = frozenset({parser for parser, _ in LOCKFILES.values()} | {"requirements.txt"})
 _PYLOCK_NAME = re.compile(r"^pylock\.[^/]+\.toml$")
 # requirements.txt, requirements-dev.txt, dev-requirements.txt,
 # requirements.prod.txt; and any .txt in a directory named requirements.
@@ -1578,6 +1839,7 @@ _PINNED_REQUIREMENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?
                                  r"[A-Za-z0-9][A-Za-z0-9._+!-]*\s*(?:;.*)?$")
 _REQUIREMENT_OPTIONS = ("--index-url", "-i", "--extra-index-url", "--find-links", "-f", "--trusted-host",
                         "--prefer-binary", "--no-binary", "--only-binary", "--pre", "--require-hashes", "--no-index")
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")   # bun.lock is JSON with trailing commas
 
 
 def lockfile_kind(path: str) -> tuple[str, str] | None:
@@ -1681,11 +1943,10 @@ def unexpected_manifests(s: Scan) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def unpinned_requirements(text: str) -> list[str]:
-    """Lines of a requirements file whose version osv-scanner cannot know:
-    anything but name==version. Includes (-r, -c) are not followed by the
-    gate, so they count too."""
-    bad, logical = [], ""
+def _requirement_lines(text: str) -> list[str]:
+    """The logical lines of a requirements file: no comment, no line break
+    after a backslash, no --hash option, unless the line has nothing else."""
+    lines, logical = [], ""
     for raw in text.splitlines() + [""]:
         line = re.sub(r"(?:^|\s)#.*$", "", raw).rstrip()
         if line.endswith("\\"):
@@ -1693,16 +1954,100 @@ def unpinned_requirements(text: str) -> list[str]:
             continue
         logical = (logical + line).strip()
         if logical:
-            tokens = [t for t in logical.split() if not t.startswith("--hash")]
-            text_line = " ".join(tokens)
-            if text_line.startswith("-"):
-                option = text_line.split("=", 1)[0].split()[0]
-                if option not in _REQUIREMENT_OPTIONS:
-                    bad.append(text_line.split()[0])
-            elif not _PINNED_REQUIREMENT.match(text_line):
-                bad.append(text_line.split()[0][:40])
+            lines.append(" ".join(t for t in logical.split() if not t.startswith("--hash")) or logical)
         logical = ""
+    return lines
+
+
+def _requirement_option(line: str) -> str:
+    return line.split("=", 1)[0].split()[0]
+
+
+def unpinned_requirements(text: str) -> list[str]:
+    """Lines of a requirements file whose version osv-scanner cannot know:
+    anything but name==version. Includes (-r, -c) are not followed by the
+    gate, so they count too."""
+    bad = []
+    for line in _requirement_lines(text):
+        if line.startswith("-"):
+            if _requirement_option(line) not in _REQUIREMENT_OPTIONS:
+                bad.append(line.split()[0])
+        elif not _PINNED_REQUIREMENT.match(line):
+            bad.append(line.split()[0][:40])
     return bad
+
+
+def requirements_unpinned(data: bytes) -> bool:
+    """Whether the gate reports a requirements file as unpinned_requirements:
+    a line unpinned_requirements finds, or a file that is not UTF-8."""
+    try:
+        return bool(unpinned_requirements(data.decode("utf-8")))
+    except UnicodeDecodeError:
+        return True
+
+
+def _block_keys(text: str) -> dict[str, bool] | None:
+    """The keys of a YAML document on its first column, each with whether it
+    has a value: a line of its own below it, or anything but {} after it.
+    None for any other form of YAML: a sequence, a quoted key, a key twice,
+    a document marker."""
+    keys: dict[str, bool] = {}
+    last = None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[0] in " \t":
+            if last is None:
+                return None
+            keys[last] = True
+            continue
+        found = _YAML_KEY.fullmatch(line)
+        if found is None or found.group(1) in keys:
+            return None
+        last = found.group(1)
+        keys[last] = (found.group(2) or "").strip() not in ("", "{}")
+    return keys
+
+
+def lists_no_package(parser: str, data: bytes) -> bool:
+    """Whether a lock file read with this parser, as run_osv gives it to
+    osv-scanner, lists no package at all: then the scanner can find none in
+    it, and the gate says zero_scanned or coverage_gap on every pull request.
+    False when it lists one, and for all that cannot be told without the
+    scanner, which alone counts packages (a file too large or that does not
+    parse, the entry of the project itself in uv.lock or yarn.lock;
+    docs/contracts/plan.md has the table). The gate asks the scanner; this is
+    for the preview of plan, which cannot run it."""
+    import tomllib  # Python 3.11+; imported here so that main() can refuse an older interpreter
+    if len(data) > MAX_LOCK_BYTES:
+        return False
+    try:
+        text = data.decode("utf-8")
+        if parser not in _LOCK_PARSERS:
+            return False
+        if not text.strip():
+            return True   # no package either way: a parser that refuses it (JSON, TOML) is no answer, and a scanner that does fails the run
+        if parser == "requirements.txt":
+            return all(line.startswith("-") and _requirement_option(line) in _REQUIREMENT_OPTIONS
+                       for line in _requirement_lines(text))
+        if parser in ("poetry.lock", "pdm.lock", "uv.lock", "pylock.toml"):
+            return not tomllib.loads(text).get("packages" if parser == "pylock.toml" else "package")
+        if parser == "pnpm-lock.yaml":
+            keys = _block_keys(text)
+            return keys is not None and not keys.get("packages")
+        if parser == "yarn.lock":
+            keys = _block_keys(text)
+            return keys is not None and set(keys) <= {"__metadata"}
+        doc = json.loads(_TRAILING_COMMA.sub(r"\1", text) if parser == "bun.lock" else text)
+        if not isinstance(doc, dict):
+            return False
+        if parser == "package-lock.json":
+            return not set(doc.get("packages") or ()) - {""} and not doc.get("dependencies")
+        if parser == "Pipfile.lock":
+            return not any(value for key, value in doc.items() if key != "_meta")
+        return not doc.get("packages")
+    except (ValueError, TypeError, RecursionError):   # UnicodeDecodeError, JSONDecodeError and TOMLDecodeError are ValueError
+        return False
 
 
 def cvss_band(score: object) -> str | None:
@@ -1740,6 +2085,16 @@ def _has_fix(records: list[dict], name: str, ecosystem: str) -> bool:
     return not seen
 
 
+def packages_gap(given: int, empty: int) -> str | None:
+    """The reason of lock files without a package, of the lock files
+    osv-scanner was given: zero_scanned when that is all of them, coverage_gap
+    when some, None when none. judge_osv gives it on what the scanner counted,
+    and the preview of plan on what lists_no_package can tell."""
+    if not empty:
+        return None
+    return reason("zero_scanned") if empty == given else reason("coverage_gap")
+
+
 def judge_osv(scan: bytes | None, code: int | None, expected: list[tuple[str, str]], policy: dict) -> dict:
     """Pure: findings, canaries and per lock file package counts from the JSON
     of an osv-scanner run (--all-packages). Paths are /sg/tree/<repository
@@ -1752,7 +2107,7 @@ def judge_osv(scan: bytes | None, code: int | None, expected: list[tuple[str, st
             raise TypeError
     except (UnicodeDecodeError, ValueError, KeyError, TypeError):
         doc, results = None, []
-        problems.append(("tool_error", "osv-scanner wrote no readable JSON report"))
+        problems.append((reason("tool_error"), "osv-scanner wrote no readable JSON report"))
     counts: dict[str, int] = {}
     items, below, any_vuln = [], 0, False
     canary_hits: set[str] = set()
@@ -1761,17 +2116,17 @@ def judge_osv(scan: bytes | None, code: int | None, expected: list[tuple[str, st
             source = result["source"]["path"]
             packages = result.get("packages") or []
         except (KeyError, TypeError):
-            problems.append(("tool_error", "osv-scanner reported a result without a source"))
+            problems.append((reason("tool_error"), "osv-scanner reported a result without a source"))
             continue
         if not isinstance(source, str) or not isinstance(packages, list):
-            problems.append(("tool_error", "osv-scanner reported a result of an unexpected type"))
+            problems.append((reason("tool_error"), "osv-scanner reported a result of an unexpected type"))
             continue
         if source.startswith("/sg/tree/"):
             rel, canary = source[len("/sg/tree/"):], None
         elif source.startswith("/sg/canary/"):
             rel, canary = None, source[len("/sg/canary/"):]
         else:
-            problems.append(("tool_error", "osv-scanner reported a file outside the scanned directories"))
+            problems.append((reason("tool_error"), "osv-scanner reported a file outside the scanned directories"))
             continue
         if rel is not None:
             counts[rel] = counts.get(rel, 0) + len(packages)
@@ -1811,23 +2166,21 @@ def judge_osv(scan: bytes | None, code: int | None, expected: list[tuple[str, st
                 else:
                     below += 1
     if doc is not None and code == 0 and any_vuln:
-        problems.append(("tool_error", "osv-scanner exited 0 yet reported vulnerabilities"))
+        problems.append((reason("tool_error"), "osv-scanner exited 0 yet reported vulnerabilities"))
     if doc is not None and code == 1 and not any_vuln:
-        problems.append(("tool_error", "osv-scanner exited 1 yet reported no vulnerability"))
+        problems.append((reason("tool_error"), "osv-scanner exited 1 yet reported no vulnerability"))
     scanned = [path for path, _ in expected if counts.get(path, 0) > 0]
     missing = [path for path, _ in expected if counts.get(path, 0) == 0]
-    if expected and not scanned:
-        problems.append(("zero_scanned", f"osv-scanner found 0 packages in all {len(expected)} lock file(s): "
-                                         + listed(missing)))
-    elif missing:
-        problems.append(("coverage_gap", f"osv-scanner found 0 packages in {len(missing)} lock file(s): "
-                                         + listed(missing)))
+    gap = packages_gap(len(expected), len(missing))
+    if gap:
+        how_many = str(len(missing)) if scanned else f"all {len(expected)}"
+        problems.append((gap, f"osv-scanner found 0 packages in {how_many} lock file(s): " + listed(missing)))
     canaries = [{"id": c["id"], "expected_rule": c["expected_rule"], "found": c["id"] in canary_hits}
                 for c in OSV_CANARIES]
     missed = [c["id"] for c in canaries if not c["found"]]
     if missed:
-        problems.append(("canary_missed", "osv-scanner did not report the canary vulnerabilities as failing: "
-                                          + ", ".join(missed)))
+        problems.append((reason("canary_missed"), "osv-scanner did not report the canary vulnerabilities as failing: "
+                                                  + ", ".join(missed)))
     return {"items": items, "below": below, "canaries": canaries, "counts": counts, "scanned": scanned,
             "missing": missing, "problems": problems}
 
@@ -1869,7 +2222,7 @@ def check_databases(s: Scan, db_dir: Path, used: set[str]) -> tuple[list[dict], 
                 raise OSError("missing")
             info = inspect_database(path)
         except (OSError, zipfile.BadZipFile, ValueError):
-            problems.append(("offline_db", f"the {db['name']} database was not downloaded or cannot be read"))
+            problems.append((reason("offline_db"), f"the {db['name']} database was not downloaded or cannot be read"))
             entries.append(entry)
             continue
         entry.update(sha256=info["sha256"], records=info["records"], newest_record=info["newest"])
@@ -1877,35 +2230,41 @@ def check_databases(s: Scan, db_dir: Path, used: set[str]) -> tuple[list[dict], 
             newest = datetime.datetime.strptime(info["newest"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.UTC)
             entry["age_s"] = max(0, int((clock - newest).total_seconds()))
         if not info["records"] or entry["age_s"] is None:
-            problems.append(("offline_db", f"the {db['name']} database has no dated records"))
+            problems.append((reason("offline_db"), f"the {db['name']} database has no dated records"))
         elif entry["used"] and entry["age_s"] > entry["max_age_s"]:
-            problems.append(("offline_db", (f"the {db['name']} database is {entry['age_s'] // 3600} h old, more "
-                                            f"than {db['max_age_hours']} h")))
+            problems.append((reason("offline_db"), (f"the {db['name']} database is {entry['age_s'] // 3600} h old, more "
+                                                    f"than {db['max_age_hours']} h")))
         entries.append(entry)
     return entries, problems
 
 
-def run_osv(s: Scan) -> dict:
-    name = "osv-scanner"
-    expected, problems, excluded = [], [], []
-    for e in s.entries:
+def osv_inputs(entries: list[Entry]) -> tuple[list[tuple[str, tuple[str, str], str]], list[tuple[str, str]]]:
+    """The lock files of a tree run_osv gives osv-scanner, as (path, its
+    lockfile_kind, oid) by path, and those it cannot give, as (path, why) in
+    the order of entries."""
+    expected, unscanned = [], []
+    for e in entries:
         kind = lockfile_kind(e.path)
         if kind is None:
             continue
-        if e.kind != "blob" or e.mode not in FILE_MODES or safe_join(Path("/"), e.path) is None or "," in e.path:
-            excluded.append(e.path)
         if e.kind != "blob" or e.mode not in FILE_MODES:
-            problems.append(("coverage_gap", f"lock file {shown(e.path)} is a symlink or submodule and is not scanned"))
+            unscanned.append((e.path, "is a symlink or submodule and is not scanned"))
         elif safe_join(Path("/"), e.path) is None:
-            problems.append(("coverage_gap", f"lock file {shown(e.path)} has a control character and is not scanned"))
+            unscanned.append((e.path, "has a control character and is not scanned"))
         elif "," in e.path:
             # osv-scanner splits the value of -L on commas: "a,b/x.lock" would
             # be two paths, neither of which exists.
-            problems.append(("coverage_gap", (f"lock file {shown(e.path)} has a comma in its path, which "
-                                              f"osv-scanner cannot take, and is not scanned")))
+            unscanned.append((e.path, "has a comma in its path, which osv-scanner cannot take, and is not scanned"))
         else:
             expected.append((e.path, kind, e.oid))
-    expected.sort()
+    return sorted(expected), unscanned
+
+
+def run_osv(s: Scan) -> dict:
+    name = "osv-scanner"
+    expected, unscanned = osv_inputs(s.entries)
+    excluded = [path for path, _ in unscanned]
+    problems = [(reason("coverage_gap"), f"lock file {shown(path)} {why}") for path, why in unscanned]
     manifests = unexpected_manifests(s)
     # A lock file the gate cannot hand to osv-scanner is expected and missing.
     every = sorted([p for p, _, _ in expected] + excluded)
@@ -1913,10 +2272,10 @@ def run_osv(s: Scan) -> dict:
                 "unexpected_manifests": [p for p, _ in manifests], "outcome": PASS}
     uncovered = []
     if manifests:
-        uncovered.append(("unexpected_manifest", (f"{len(manifests)} dependency file(s) whose packages osv-scanner in "
-                                                  f"this gate does not see: "
-                                                  + "; ".join(f"{shown(p)} ({why})" for p, why in manifests[:MAX_SHOWN])
-                                                  + (" ..." if len(manifests) > MAX_SHOWN else ""))))
+        uncovered.append((reason("unexpected_manifest"), (f"{len(manifests)} dependency file(s) whose packages osv-scanner in "
+                                                          f"this gate does not see: "
+                                                          + "; ".join(f"{shown(p)} ({why})" for p, why in manifests[:MAX_SHOWN])
+                                                          + (" ..." if len(manifests) > MAX_SHOWN else ""))))
     version, ready = prepare(s, name)
     if ready:
         coverage["outcome"] = INCONCLUSIVE if every or manifests else PASS
@@ -1933,17 +2292,12 @@ def run_osv(s: Scan) -> dict:
     for path, (parser, _), oid in expected:
         data = s.git.blob_bytes(oid, MAX_SCANNED_FILE)
         write_new_file(safe_join(tree, path), data)
-        if parser == "requirements.txt":
-            try:
-                bad = unpinned_requirements(data.decode("utf-8"))
-            except UnicodeDecodeError:
-                bad = ["(not UTF-8)"]
-            if bad:
-                unpinned.append(path)
+        if parser == "requirements.txt" and requirements_unpinned(data):
+            unpinned.append(path)
     if unpinned:
-        problems.append(("unpinned_requirements", f"{len(unpinned)} requirements file(s) list packages without an "
-                                                  f"exact version (name==version), so osv-scanner cannot know them: "
-                                                  + listed(unpinned)))
+        problems.append((reason("unpinned_requirements"), f"{len(unpinned)} requirements file(s) list packages without an "
+                                                          f"exact version (name==version), so osv-scanner cannot know them: "
+                                                          + listed(unpinned)))
     canary_args = [a for c in OSV_CANARIES for a in ("-L", f"{c['parser']}:canary/{c['file']}")]
     common = ["--no-call-analysis=all", "--format", "json", "--all-packages", "--config", "config/osv-scanner.toml"]
     variables = {"OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": "/sg/db"}
@@ -1959,7 +2313,7 @@ def run_osv(s: Scan) -> dict:
     used = {eco for _, (_, eco), _ in expected}
     databases, db_problems = check_databases(s, db_dir, used)
     if fetch.code not in (0, 1):
-        db_problems.insert(0, ("offline_db", f"the database download {fetch.detail or f'exited {fetch.code}'}"))
+        db_problems.insert(0, (reason("offline_db"), f"the database download {fetch.detail or f'exited {fetch.code}'}"))
     # 2. Scan: no network, everything read-only but the report directory.
     tree_args = [a for path, (parser, _), _ in expected for a in ("-L", f"{parser}:tree/{path}")]
     argv = ["scan", "source", "--offline", "--offline-vulnerabilities", "--no-resolve", *common,
@@ -2077,7 +2431,7 @@ def judge_zizmor(stdout: bytes, stderr: str, code: int | None, expected: list[st
             raise TypeError
     except (UnicodeDecodeError, ValueError, TypeError):
         findings = []
-        problems.append(("tool_error", "zizmor wrote no readable JSON report"))
+        problems.append((reason("tool_error"), "zizmor wrote no readable JSON report"))
     def severity_of(f: dict) -> str:
         return _ZIZMOR_SEVERITY.get(str((f.get("determinations") or {}).get("severity", "")), policy["unknown_severity"])
 
@@ -2091,7 +2445,7 @@ def judge_zizmor(stdout: bytes, stderr: str, code: int | None, expected: list[st
     for f in kept:
         path, line = _primary(f) if isinstance(f, dict) else (None, None)
         if not path or not path.startswith("tree/") or not isinstance(f.get("ident"), str):
-            problems.append(("tool_error", "zizmor reported a finding outside the scanned workflows"))
+            problems.append((reason("tool_error"), "zizmor reported a finding outside the scanned workflows"))
             continue
         severity = severity_of(f)
         rel = path[len("tree/"):]
@@ -2102,35 +2456,42 @@ def judge_zizmor(stdout: bytes, stderr: str, code: int | None, expected: list[st
         else:
             below += 1
     if code == 0 and findings:
-        problems.append(("tool_error", "zizmor exited 0 yet reported findings"))
+        problems.append((reason("tool_error"), "zizmor exited 0 yet reported findings"))
     if code in ZIZMOR_FINDING_CODES - {0} and not findings:
-        problems.append(("tool_error", f"zizmor exited {code} yet reported no finding"))
+        problems.append((reason("tool_error"), f"zizmor exited {code} yet reported no finding"))
     missing = [p for p in expected if "tree/" + p not in completed]
     if missing:
-        problems.append(("coverage_gap", f"zizmor did not audit {len(missing)} workflow(s): " + listed(missing)))
+        problems.append((reason("coverage_gap"), f"zizmor did not audit {len(missing)} workflow(s): " + listed(missing)))
     if not canary and reported:
-        problems.append(("canary_missed", (f"zizmor reported its {ZIZMOR_CANARY_RULE} canary at "
-                                           f"{severity_of(reported[0])}, below min_severity {policy['min_severity']} "
-                                           f"of lock.json, so the canary could not fail the gate")))
+        problems.append((reason("canary_missed"), (f"zizmor reported its {ZIZMOR_CANARY_RULE} canary at "
+                                                   f"{severity_of(reported[0])}, below min_severity {policy['min_severity']} "
+                                                   f"of lock.json, so the canary could not fail the gate")))
     elif not canary:
-        problems.append(("canary_missed", f"zizmor did not report the {ZIZMOR_CANARY_RULE} canary of the gate"))
+        problems.append((reason("canary_missed"), f"zizmor did not report the {ZIZMOR_CANARY_RULE} canary of the gate"))
     return {"items": items, "below": below, "canary": canary, "removed": removed, "audited": len(completed & {
         "tree/" + p for p in expected}), "problems": problems}
 
 
-def run_zizmor(s: Scan) -> dict:
-    name = "zizmor"
-    expected, problems = [], []
-    for e in s.entries:
+def zizmor_inputs(entries: list[Entry]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The workflows of a tree run_zizmor gives zizmor, as (path, oid) by
+    path, and those it cannot give, as (path, why) in the order of entries."""
+    expected, unscanned = [], []
+    for e in entries:
         if not _WORKFLOW_FILE.match(e.path):
             continue
         if e.kind != "blob" or e.mode not in FILE_MODES:
-            problems.append(("coverage_gap", f"workflow {shown(e.path)} is a symlink or submodule and is not audited"))
+            unscanned.append((e.path, "is a symlink or submodule and is not audited"))
         elif safe_join(Path("/"), e.path) is None:
-            problems.append(("coverage_gap", f"workflow {shown(e.path)} has a control character and is not audited"))
+            unscanned.append((e.path, "has a control character and is not audited"))
         else:
             expected.append((e.path, e.oid))
-    expected.sort()
+    return sorted(expected), unscanned
+
+
+def run_zizmor(s: Scan) -> dict:
+    name = "zizmor"
+    expected, unscanned = zizmor_inputs(s.entries)
+    problems = [(reason("coverage_gap"), f"workflow {shown(path)} {why}") for path, why in unscanned]
     version, ready = prepare(s, name)
     if ready:
         return {"reasons": ready + problems}
@@ -2237,16 +2598,69 @@ _BOM_CODECS = ((b"\x00\x00\xfe\xff", "utf-32-be"), (b"\xff\xfe\x00\x00", "utf-32
                (b"\xff\xfe", "utf-16-le"))
 _WIDE_CODECS = {(2, 0): "utf-16-le", (2, 1): "utf-16-be", (4, 0): "utf-32-le", (4, 3): "utf-32-be"}
 _PYTHON_SOURCE = (".py", ".pyw", ".pyi")
+# The files whose reader ends a line at a bare CR, where semgrep 1.179.0 does
+# not: what the real semgrep maps to Python, C, C++, Swift, Lua, Java,
+# JavaScript and TypeScript, in lower case, and .pyw, for which it has no
+# analyzer. Python, clang, Swift, Lua and node were run on such files (node on
+# JavaScript, in .jsx and .tsx too, and on TypeScript by its type stripping;
+# it refuses <div/> in .jsx and .tsx and a type in .tsx, so JSX and TSX were
+# not run); Java was not, it stands here on the JLS (3.4). Lua skips a first
+# line on # up to LF, past a bare CR: there the copy is not what it reads. A
+# file of any other language keeps its bytes (ADR 0006, item 50, which has
+# what the copy does not mend).
+_JS_SOURCE = frozenset({".js", ".jsx", ".cjs", ".mjs", ".ts", ".tsx"})
+_BARE_CR_ENDS_A_LINE = frozenset({
+    *_PYTHON_SOURCE, ".c", ".h", ".cc", ".cpp", ".cxx", ".c++", ".pcc", ".tpp", ".hh", ".hpp", ".hxx", ".inl", ".ipp",
+    ".swift", ".lua", ".java", *_JS_SOURCE})
+# U+2028 and U+2029 in UTF-8.
+_JS_LINE_SEPARATOR = re.compile(rb"\xe2\x80[\xa8\xa9]")
+# The text codecs whose decoder is not linear in a file: punycode inserts each
+# character into a string, and idna gives it a long label on 3.11. Every other
+# text codec of 3.11 and 3.14 was measured linear (ADR 0006, item 24).
+_PYTHON_QUADRATIC = frozenset({"punycode", "idna"})
 _NON_ASCII = re.compile(r"[^\x00-\x7f]")
+# A declaration of an encoding, as the tokenizer of CPython reads the first
+# two lines of a file: a line ends at LF, CRLF or a bare CR.
+_PYTHON_LINE = re.compile(rb"[^\r\n]*(?:\r\n?|\n|\Z)")
+_PYTHON_BLANK = re.compile(rb"[ \t\f]*(?:[#\r\n]|\Z)")
+_PYTHON_DECLARATION = re.compile(rb"[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 
-def semgrep_text(data: bytes) -> bytes | None:
-    """The UTF-8 copy semgrep is given of a head file it cannot read as it
-    is, or None. semgrep 1.179.0 applies no regex rule at all to a file that
-    is not valid UTF-8, one stray byte is enough, says nothing about it and
-    lists the file as scanned (ADR 0006). Text in UTF-16 or UTF-32 (the
-    files gitleaks cannot read) is decoded; in any other file every byte that
-    is not part of valid UTF-8 becomes "?". Line numbers do not change."""
+def python_source(path: str, data: bytes) -> bool:
+    """Whether Python reads a file: by its extension, in any letter case, or
+    by a #! line that names it, when the name has no extension."""
+    stem, dot, ext = posixpath.basename(path).rpartition(".")
+    if dot and stem:
+        return ("." + ext).lower() in _PYTHON_SOURCE
+    return re.match(rb"#![^\n]*python", data) is not None
+
+
+def bare_cr_ends_a_line(path: str, data: bytes) -> bool:
+    """Whether the reader of a file ends a line at a bare CR, in the sense of
+    _BARE_CR_ENDS_A_LINE: by its name, which semgrep reads whole (a file
+    named .py is Python to it), or as python_source has it."""
+    _, dot, ext = posixpath.basename(path).rpartition(".")
+    return (dot + ext).lower() in _BARE_CR_ENDS_A_LINE or python_source(path, data)
+
+
+def js_line_separator(path: str, data: bytes) -> bool:
+    """Whether a file of JavaScript or TypeScript (_JS_SOURCE, by its name in
+    lower case) has U+2028 or U+2029 in the text semgrep is given. node ends
+    a line at each outside a string; after "use client" and U+2028 in .tsx
+    semgrep 1.179.0 found no read of the key that node runs. In a string
+    node takes them, where LF is a SyntaxError, so the copy keeps them and
+    the file is a gap (ADR 0006, item 50)."""
+    _, dot, ext = posixpath.basename(path).rpartition(".")
+    if (dot + ext).lower() not in _JS_SOURCE:
+        return False
+    text = _utf8_text(data)
+    return _JS_LINE_SEPARATOR.search(data if text is None else text) is not None
+
+
+def _utf8_text(data: bytes) -> bytes | None:
+    """A file in UTF-8, or None if it is in UTF-8 already: text in UTF-16 or
+    UTF-32 (the files gitleaks cannot read) is decoded; in any other file
+    every byte that is not part of valid UTF-8 becomes "?"."""
     for bom, codec in _BOM_CODECS:
         if data.startswith(bom):
             return data[len(bom):].decode(codec, "replace").encode("utf-8")
@@ -2261,6 +2675,34 @@ def semgrep_text(data: bytes) -> bytes | None:
     return None
 
 
+def semgrep_text(path: str, data: bytes) -> bytes | None:
+    """The copy semgrep is given of a head file it cannot read as it is, or
+    None. semgrep 1.179.0 applies no regex rule at all to a file that is not
+    valid UTF-8, one stray byte is enough, says nothing about it and lists
+    the file as scanned (ADR 0006): such a file gets a copy in UTF-8
+    (_utf8_text), which keeps its line numbers. Nor is a bare CR always a
+    line end to it where it is one to the reader of the file: what follows
+    one in a comment of Python, C, C++, Swift, Lua or Java (not run) is a
+    comment to semgrep and code to that reader, and in JavaScript and
+    TypeScript semgrep found no call in "use client"\\rdangerous(1)\\r and
+    reported PartialParsing, where node runs the call. So in a file of those
+    languages (bare_cr_ends_a_line) each CR not followed by LF becomes LF, in
+    the copy in UTF-8 if there is one. CRLF stays, and so do U+2028 and
+    U+2029 (js_line_separator). The line of a finding in such a file then
+    counts a bare CR as a line end, as Python does; the offsets stay, unless
+    the file was decoded too. A file of any other
+    language keeps its CR: semgrep reports a syntax error in such a copy of a
+    Go string with a bare CR, where the file as it is has none."""
+    text = _utf8_text(data)
+    if not bare_cr_ends_a_line(path, data):
+        return text
+    utf8 = data if text is None else text
+    # 0xff is in no UTF-8. A regular expression takes eight times as long on
+    # 128 MiB of CR and forty times the memory.
+    lines = utf8.replace(b"\r\n", b"\xff").replace(b"\r", b"\n").replace(b"\xff", b"\r\n")
+    return text if lines == utf8 else lines
+
+
 def regex_only(path: str, head: bytes) -> bool:
     """Whether semgrep reads a head file with its regex rules only, by its
     name: code it has no analyzer for (_SEMGREP_NO_ANALYZER)."""
@@ -2271,26 +2713,87 @@ def regex_only(path: str, head: bytes) -> bool:
     return ext.lower() in _SEMGREP_NO_ANALYZER or (ext.lower() in _SEMGREP_LOWER_ONLY and ext != ext.lower())
 
 
+def python_declaration(data: bytes) -> tuple[str, int] | None:
+    """The encoding CPython reads a file in, when it is declared (PEP 263),
+    and where it starts to: the offset of the last byte of the line of the
+    declaration. As its tokenizer: of the first two lines, which end at LF,
+    CRLF or a bare CR, in a comment that is the only thing on its line, after
+    a first line of blanks or a comment. None without a declaration; a UTF-8
+    byte order mark is neither, so it is None too, and rightly: under one
+    Python takes UTF-8 or refuses the file. tokenize.detect_encoding is not
+    this: it splits lines at LF only, so it misses the declaration in
+    "\\r# coding: utf-7\\n", and on 3.11 it refuses a declaration line that is
+    not UTF-8 where python file.py runs it (under latin-1, for one; 3.14
+    takes that line)."""
+    at = 0
+    for _ in range(2):
+        end = _PYTHON_LINE.match(data, at).end()
+        declared = _PYTHON_DECLARATION.match(data, at, end)
+        if declared:
+            return declared.group(1).decode("ascii"), max(end - 1, 0)
+        if not _PYTHON_BLANK.match(data, at, end):
+            return None
+        at = end
+    return None
+
+
+def _python_script(data: bytes, start: int, encoding: str, errors: str) -> str:
+    """What CPython reads after the line of a declaration when it runs a
+    file: it opens the file again in text mode at the last byte of that line,
+    and drops the rest of that line in the new encoding."""
+    with io.TextIOWrapper(io.BytesIO(data[start:]), encoding=encoding, errors=errors) as text:
+        text.readline()
+        return text.read()
+
+
+def _python_module(data: bytes) -> bytes:
+    """What compile() decodes of a file, which is not its bytes: it makes CR
+    and CRLF into LF and ends the last line first, so the codec never reads
+    a CR, and always a line end after the last byte."""
+    text = re.sub(rb"\r\n?", b"\n", data)
+    return text if text.endswith(b"\n") else text + b"\n"
+
+
 def python_encoding(path: str, data: bytes) -> str | None:
     """The source encoding a Python file declares (PEP 263), if Python reads
     other ASCII code from it than semgrep, which reads UTF-8: utf-7 turns
-    "+AHM-" into "s", unicode_escape turns "\\x73" into "s". None if the two
-    agree on every ASCII character, or if Python cannot run the file."""
-    stem, dot, ext = posixpath.basename(path).rpartition(".")
-    if dot and stem:
-        if ("." + ext).lower() not in _PYTHON_SOURCE:
-            return None
-    elif not re.match(rb"#![^\n]*python", data):
+    "+AHM-" into "s", unicode_escape turns "\\x73" into "s". Python reads a
+    file in two ways, each of which can differ: as a script, the first lines
+    as they are and the rest in the encoding, and as a module (import,
+    compile), all of it in the encoding once its line ends are LF
+    (_python_module). The bytes as they are are read too, which no Python
+    does: that can only report more. None if semgrep and each of these agree
+    on every ASCII character, or do not decode. This compares text and
+    compiles nothing, so a file whose text differs and that Python then
+    refuses with a SyntaxError is reported too. Which of 3.11 and 3.14
+    refuses a file for its first lines differs, and a file one of them runs
+    counts for both, so a file only one of them runs is reported too. A
+    character out of ASCII is not compared: a name Python makes ASCII (NFKC)
+    from letters out of ASCII reads the same to this function, in any
+    encoding, UTF-8 too. A file in punycode or idna is not read at all and is
+    reported whatever it holds: their decoders are not linear
+    (_PYTHON_QUADRATIC), and 128 MiB of a file would not end."""
+    if not python_source(path, data):
         return None
+    declared = python_declaration(data)
+    if declared is None:
+        return None
+    name, start = declared
     try:
-        name, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
-        if name in ("utf-8", "utf-8-sig"):
-            return None
-        python = data.decode(name)
-    except (SyntaxError, LookupError, UnicodeError, ValueError, TypeError):
-        return None   # Python refuses to run the file
-    semgrep = data.decode("utf-8", "surrogateescape")
-    return None if _NON_ASCII.sub("", python) == _NON_ASCII.sub("", semgrep) else name
+        if codecs.lookup(name).name in _PYTHON_QUADRATIC:
+            return name
+    except LookupError:
+        return None   # Python refuses a file in an encoding it does not know
+    # compile() refuses a NUL byte before it decodes anything.
+    module = () if b"\0" in data else (data.decode, _python_module(data).decode)
+    for read in (lambda *how: _python_script(data, start, *how), *module):
+        try:
+            python = read(name, "strict")
+        except (LookupError, UnicodeError, ValueError, TypeError):
+            continue   # Python does not get past the encoding this way
+        if _NON_ASCII.sub("", python) != _NON_ASCII.sub("", read("utf-8", "surrogateescape")):
+            return name
+    return None
 
 
 # The gate's own rules whose findings are about a variable: a finding of
@@ -2336,7 +2839,8 @@ def semgrep_canaries() -> tuple[dict, ...]:
     all, since those rules never block. Whether a canary of the Registry
     blocks is policy registry of lock.json. The sg-supabase-secret-key canary
     is a Vue component: it also shows that the regex rules read code semgrep
-    has no analyzer for."""
+    has no analyzer for. The Firebase canaries are written whole: their rules
+    read only files named *.rules and *.rules.json."""
     public, vite = "NEXT_" + "PUBLIC_", "VI" + "TE_"
     return (
         {"id": "semgrep-sg-public-secret", "expected_rule": "sg-public-secret", "blocking": True,
@@ -2351,6 +2855,12 @@ def semgrep_canaries() -> tuple[dict, ...]:
          "content": "<script setup>\nconst key = \"sb_" + "secret_security-gate-canary\";\n</script>\n"},
         {"id": "semgrep-sg-public-key", "expected_rule": "sg-public-key", "blocking": False,
          "file": "web/public-key.ts", "content": f"export const token = import.meta.env.{vite}SG_CANARY_TOKEN;\n"},
+        {"id": "semgrep-sg-firebase-open-rules", "expected_rule": "sg-firebase-open-rules", "blocking": True,
+         "file": "firebase/firestore.rules",
+         "content": "service cloud.firestore {\n  match /databases/{database}/documents {\n    match /{document=**} {\n      allow read, write: if true;\n    }\n  }\n}\n"},
+        {"id": "semgrep-sg-firebase-open-database", "expected_rule": "sg-firebase-open-database", "blocking": True,
+         "file": "firebase/database.rules.json",
+         "content": '{\n  "rules": {\n    ".read": "now < 1",\n    ".write": "now < 1"\n  }\n}\n'},
         {"id": "semgrep-registry", "expected_rule": SEMGREP_REGISTRY_CANARY_RULE, "blocking": None, "registry": True,
          "file": "registry.py", "content": "import subprocess\n\nsubprocess.call(command, " + "shell=True)\n"},
         {"id": "semgrep-registry-js", "expected_rule": SEMGREP_REGISTRY_JS_CANARY_RULE, "blocking": None,
@@ -2477,7 +2987,8 @@ def semgrep_roots(paths: list[str]) -> list[list[str]]:
     """The head paths split into scanning roots so that no two paths of one
     root are the same file on a case- or normalization-insensitive file
     system (macOS): ".GitHub/x.yml" next to ".github/y.yml" goes into a
-    second root. On Linux every path lands in the first root."""
+    second root. Only the names decide, so it does on every system, Linux
+    too, where the first root could hold both."""
     roots: list[tuple[dict[str, str], list[str]]] = []
     for path in paths:
         parts = path.split("/")
@@ -2539,10 +3050,10 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
     problems: list[tuple[str, str]] = []
     clash = set(own_ids) & rule_ids if registry else set()
     if clash:
-        problems.append(("offline_db", (f"the downloaded Semgrep Registry rules have {len(clash)} rule id(s) of the "
-                                        f"gate's own rules ({', '.join(shown(x) for x in sorted(clash)[:MAX_SHOWN])}): "
-                                        f"those ids are the gate's, and a finding of the Registry under one would "
-                                        f"read as the gate's in the receipt")))
+        problems.append((reason("offline_db"), (f"the downloaded Semgrep Registry rules have {len(clash)} rule id(s) of the "
+                                                f"gate's own rules ({', '.join(shown(x) for x in sorted(clash)[:MAX_SHOWN])}): "
+                                                f"those ids are the gate's, and a finding of the Registry under one would "
+                                                f"read as the gate's in the receipt")))
     try:
         doc = json.loads((report or b"").decode("utf-8"))
         results, errors, paths = doc["results"], doc.get("errors") or [], doc.get("paths") or {}
@@ -2550,15 +3061,15 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
             raise TypeError
     except (UnicodeDecodeError, ValueError, KeyError, TypeError):
         doc, results, errors, paths = None, [], [], {}
-        problems.append(("tool_error", "semgrep wrote no readable JSON report"))
+        problems.append((reason("tool_error"), "semgrep wrote no readable JSON report"))
     counts = _SEMGREP_RULE_COUNT.findall(_ANSI.sub("", stderr))
     loaded = int(counts[-1].replace(",", "")) if counts else None
     if loaded is None:
-        problems.append(("tool_error", "semgrep did not report how many rules it loaded"))
+        problems.append((reason("tool_error"), "semgrep did not report how many rules it loaded"))
     elif loaded != rules_given:
-        problems.append(("coverage_gap", f"semgrep loaded {loaded} rule(s), the gate gave it {rules_given}"))
+        problems.append((reason("coverage_gap"), f"semgrep loaded {loaded} rule(s), the gate gave it {rules_given}"))
     if doc is not None and doc.get("skipped_rules"):
-        problems.append(("coverage_gap", f"semgrep skipped {len(doc['skipped_rules'])} rule(s) it was given"))
+        problems.append((reason("coverage_gap"), f"semgrep skipped {len(doc['skipped_rules'])} rule(s) it was given"))
     roots = [root_name(i) + "/" for i in range(len(given))]
 
     def head_path(path: str) -> str | None:
@@ -2580,7 +3091,7 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
                     and not isinstance(line, bool)):
                 raise TypeError
         except (KeyError, TypeError):
-            problems.append(("tool_error", "semgrep reported a finding without rule, path or line"))
+            problems.append((reason("tool_error"), "semgrep reported a finding without rule, path or line"))
             continue
         rel = head_path(path)
         if rule not in rule_ids:
@@ -2595,13 +3106,13 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
             if not registry and rule in SEMGREP_NAMED_RULES and isinstance(end, dict):
                 spans.setdefault((rule, rel, raw[-1]["line"]), (path, start.get("offset"), end.get("offset")))
         else:
-            problems.append(("tool_error", "semgrep reported a file outside the scanned directories"))
+            problems.append((reason("tool_error"), "semgrep reported a file outside the scanned directories"))
     if unknown:
-        problems.append(("tool_error", (f"semgrep reported {len(unknown)} rule id(s) that "
-                                        + ("the downloaded rulesets do not have: " if registry
-                                           else "the gate's rules do not have: ")
-                                        + ", ".join(shown(x) for x in sorted(unknown)[:MAX_SHOWN])
-                                        + (" ..." if len(unknown) > MAX_SHOWN else ""))))
+        problems.append((reason("tool_error"), (f"semgrep reported {len(unknown)} rule id(s) that "
+                                                + ("the downloaded rulesets do not have: " if registry
+                                                   else "the gate's rules do not have: ")
+                                                + ", ".join(shown(x) for x in sorted(unknown)[:MAX_SHOWN])
+                                                + (" ..." if len(unknown) > MAX_SHOWN else ""))))
     kept, removed = semgrep_post_filter(raw, owned, reference, confirmed) if registry else (raw, [])
     # At or above the threshold, a finding of the gate's rules fails; one of
     # the Registry's fails only under registry: block, else it is a signal.
@@ -2627,9 +3138,9 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
         else:
             signal.append(item)
     if doc is not None and code == 0 and results:
-        problems.append(("tool_error", "semgrep exited 0 yet reported findings"))
+        problems.append((reason("tool_error"), "semgrep exited 0 yet reported findings"))
     if doc is not None and code == 1 and not results:
-        problems.append(("tool_error", "semgrep exited 1 yet reported no finding"))
+        problems.append((reason("tool_error"), "semgrep exited 1 yet reported no finding"))
 
     found = []
     for c in canaries:
@@ -2640,15 +3151,15 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
         if ok:
             continue
         if reported:
-            problems.append(("canary_missed", (f"semgrep reported its {c['expected_rule']} canary at {reported[0]}, "
-                                               f"below min_severity {policy['min_severity']} of lock.json, so the "
-                                               f"canary could not fail the gate")))
+            problems.append((reason("canary_missed"), (f"semgrep reported its {c['expected_rule']} canary at {reported[0]}, "
+                                                       f"below min_severity {policy['min_severity']} of lock.json, so the "
+                                                       f"canary could not fail the gate")))
         elif registry and rule_ids and c["expected_rule"] not in rule_ids:
-            problems.append(("canary_missed", (f"the downloaded Semgrep Registry rules have no rule "
-                                               f"{c['expected_rule']}, whose canary the gate checks: the Registry "
-                                               f"changed under the gate")))
+            problems.append((reason("canary_missed"), (f"the downloaded Semgrep Registry rules have no rule "
+                                                       f"{c['expected_rule']}, whose canary the gate checks: the Registry "
+                                                       f"changed under the gate")))
         else:
-            problems.append(("canary_missed", f"semgrep did not report the {c['expected_rule']} canary of the gate"))
+            problems.append((reason("canary_missed"), f"semgrep did not report the {c['expected_rule']} canary of the gate"))
 
     # Coverage: semgrep lists every file it read in paths.scanned. A file the
     # gate gave it and it did not list, skipped for any reason but a partial
@@ -2664,9 +3175,9 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
         for path in members:
             if root + path not in scanned_raw:
                 gaps[path] = skipped.get(root + path, "not scanned")
-    for path, reason in skipped.items():
-        if head_path(path) is not None and reason != _SEMGREP_PARTIAL:
-            gaps.setdefault(head_path(path), reason)
+    for path, why in skipped.items():
+        if head_path(path) is not None and why != _SEMGREP_PARTIAL:
+            gaps.setdefault(head_path(path), why)
     fatal, unparsed = set(), set()
     for e in errors:
         if not isinstance(e, dict):
@@ -2684,16 +3195,16 @@ def judge_semgrep(report: bytes | None, stderr: str, code: int | None, given: li
         else:
             fatal.add(etype)
     if fatal:
-        problems.append(("tool_error", "semgrep reported errors: " + ", ".join(shown(x) for x in sorted(fatal))))
+        problems.append((reason("tool_error"), "semgrep reported errors: " + ", ".join(shown(x) for x in sorted(fatal))))
     if gaps:
-        problems.append(("coverage_gap", f"semgrep did not fully scan {len(gaps)} file(s): "
-                                         + "; ".join(f"{shown(p)} ({gaps[p]})" for p in sorted(gaps)[:MAX_SHOWN])
-                                         + (" ..." if len(gaps) > MAX_SHOWN else "")))
+        problems.append((reason("coverage_gap"), f"semgrep did not fully scan {len(gaps)} file(s): "
+                                                 + "; ".join(f"{shown(p)} ({gaps[p]})" for p in sorted(gaps)[:MAX_SHOWN])
+                                                 + (" ..." if len(gaps) > MAX_SHOWN else "")))
     total = sum(len(members) for members in given)
     scanned = sum(1 for root, members in zip(roots, given, strict=True) for path in members
                   if root + path in scanned_raw)
     if total and not scanned:
-        problems.append(("zero_scanned", f"semgrep scanned 0 of the {total} file(s) it was given"))
+        problems.append((reason("zero_scanned"), f"semgrep scanned 0 of the {total} file(s) it was given"))
     return {"items": items, "signal": signal, "below": below, "below_items": below_items, "canaries": found,
             "removed": removed, "loaded": loaded, "scanned": scanned, "unparsed": sorted(unparsed - set(gaps)),
             "problems": problems}
@@ -2703,30 +3214,47 @@ def load_semgrep_rules(s: Scan) -> tuple[bytes | None, tuple[str, str] | None]:
     """The gate's rules, from the commit lock.json is read from."""
     entry = s.git.entry_at(s.config, SEMGREP_RULES_PATH)
     if entry is None:
-        return None, ("invalid_document", f"{SEMGREP_RULES_PATH} is missing, so semgrep cannot run")
+        return None, (reason("invalid_document"), f"{SEMGREP_RULES_PATH} is missing, so semgrep cannot run")
     mode, kind, oid = entry
     if kind != "blob" or mode not in FILE_MODES:
-        return None, ("invalid_document", f"{SEMGREP_RULES_PATH} is not a regular file")
+        return None, (reason("invalid_document"), f"{SEMGREP_RULES_PATH} is not a regular file")
     try:
         data = s.git.blob_bytes(oid, MAX_LOCK_BYTES)
     except GitError as exc:
-        return None, ("invalid_document", f"{SEMGREP_RULES_PATH}: {exc}")
+        return None, (reason("invalid_document"), f"{SEMGREP_RULES_PATH}: {exc}")
     if not ruleset_rules(data)[0]:
-        return None, ("invalid_document", f"{SEMGREP_RULES_PATH} has no rules list")
+        return None, (reason("invalid_document"), f"{SEMGREP_RULES_PATH} has no rules list")
     return data, None
+
+
+def semgrep_inputs(files: list[Entry], blobs: dict[str, Blob]) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Of the regular files of a tree, those run_semgrep gives semgrep, as
+    {path: oid}, and those it cannot give, as (path, why), both by path. A
+    .semgrepignore is neither: gate-integrity reports it."""
+    given, unscanned = {}, []
+    for e in sorted(files, key=lambda e: e.path):
+        if posixpath.basename(e.path).lower() == SEMGREP_IGNORE:
+            continue
+        if safe_join(Path("/"), e.path) is None:
+            unscanned.append((e.path, "has a control character in its path and is not scanned by semgrep"))
+        elif blobs[e.oid].size > MAX_SEMGREP_FILE:
+            unscanned.append((e.path, f"is larger than {MAX_SEMGREP_FILE} bytes and is not scanned by semgrep"))
+        else:
+            given[e.path] = e.oid
+    return given, unscanned
 
 
 def run_semgrep(s: Scan) -> dict:
     name = "semgrep"
     if s.lock is not None and name not in s.lock["tools"]:
-        return {"reasons": [("tool_missing", (f"semgrep did not run: {LOCK_PATH} has schema_version "
-                                              f"{s.lock['schema_version']}, which pins no semgrep; update it to "
-                                              f"schema_version {LOCK_SCHEMA_VERSION}"))]}
+        return {"reasons": [(reason("tool_missing"), (f"semgrep did not run: {LOCK_PATH} has schema_version "
+                                                      f"{s.lock['schema_version']}, which pins no semgrep; update it to "
+                                                      f"schema_version {LOCK_SCHEMA_VERSION}"))]}
     own = None
     if s.lock is not None:
         own, problem = load_semgrep_rules(s)
         if problem:
-            return {"reasons": [problem, ("tool_missing", f"semgrep did not run: {problem[1]}")]}
+            return {"reasons": [problem, (reason("tool_missing"), f"semgrep did not run: {problem[1]}")]}
     version, ready = prepare(s, name)
     if ready:
         return {"reasons": ready}
@@ -2740,18 +3268,8 @@ def run_semgrep(s: Scan) -> dict:
     # gate-integrity), written from git objects. An empty .semgrepignore of
     # the gate's at each scanning root: without one semgrep skips tests/,
     # build/, dist/, vendor/, node_modules/ and more without a word.
-    problems, files = [], {}
-    for e in sorted(s.regular_files(), key=lambda e: e.path):
-        if posixpath.basename(e.path).lower() == SEMGREP_IGNORE:
-            continue
-        if safe_join(tree, e.path) is None:
-            problems.append(("coverage_gap", (f"{shown(e.path)} has a control character in its path and is not "
-                                              f"scanned by semgrep")))
-        elif s.blobs[e.oid].size > MAX_SEMGREP_FILE:
-            problems.append(("coverage_gap", (f"{shown(e.path)} is larger than {MAX_SEMGREP_FILE} bytes and is not "
-                                              f"scanned by semgrep")))
-        else:
-            files[e.path] = e.oid
+    files, unscanned = semgrep_inputs(s.regular_files(), s.blobs)
+    problems = [(reason("coverage_gap"), f"{shown(path)} {why}") for path, why in unscanned]
     given = semgrep_roots(sorted(files))
     pairs, heads, root_dirs = [], [], []
     for i, members in enumerate(given):
@@ -2766,12 +3284,13 @@ def run_semgrep(s: Scan) -> dict:
         root = next(r for r in root_dirs if target.is_relative_to(r))
         path = target.relative_to(root).as_posix()
         given[root_dirs.index(root)].remove(path)
-        problems.append(("coverage_gap", (f"{shown(path)} clashes with another path on this file system and is not "
-                                          f"scanned by semgrep")))
-    # What semgrep cannot read as it is: a UTF-8 copy in place of the file
+        problems.append((reason("coverage_gap"), (f"{shown(path)} clashes with another path on this file system and is not "
+                                                  f"scanned by semgrep")))
+    # What semgrep cannot read as it is: a copy in place of the file, in
+    # UTF-8 and with a line for each bare CR where the language has one
     # (semgrep_text), and Python whose declared encoding semgrep does not
     # read (a gap). Code it has no analyzer for is listed in the receipt.
-    transcoded, by_name, encodings = 0, set(), {}
+    transcoded, by_name, encodings, separators = 0, set(), {}, []
     for (oid, target), path in zip(pairs, heads, strict=True):
         if target in clashed:
             continue
@@ -2781,17 +3300,25 @@ def run_semgrep(s: Scan) -> dict:
         encoding = python_encoding(path, data)
         if encoding:
             encodings[path] = encoding
-        text = semgrep_text(data)
+        if js_line_separator(path, data):
+            separators.append(path)
+        text = semgrep_text(path, data)
         if text is not None:
             target.write_bytes(text)
             transcoded += 1
     if encodings:
-        problems.append(("coverage_gap", (f"{len(encodings)} Python file(s) declare a source encoding in which "
-                                          f"Python reads other code than semgrep checks: "
-                                          + "; ".join(f"{shown(p)} ({encodings[p]})"
-                                                      for p in sorted(encodings)[:MAX_SHOWN])
-                                          + (" ..." if len(encodings) > MAX_SHOWN else "")
-                                          + ". Save them as UTF-8")))
+        problems.append((reason("coverage_gap"), (f"{len(encodings)} Python file(s) declare a source encoding in which "
+                                                  f"Python reads other code than semgrep checks: "
+                                                  + "; ".join(f"{shown(p)} ({encodings[p]})"
+                                                              for p in sorted(encodings)[:MAX_SHOWN])
+                                                  + (" ..." if len(encodings) > MAX_SHOWN else ".")
+                                                  + " Save them as UTF-8")))
+    if separators:
+        problems.append((reason("coverage_gap"), (f"{len(separators)} JavaScript or TypeScript file(s) have U+2028 or "
+                                                  f"U+2029, which node reads as a line end where semgrep may not: "
+                                                  + listed(sorted(separators), ".") + " Write each as \\u2028 or "
+                                                  "\\u2029 in a string of code, as {\"\\u2028\"} in JSX text and "
+                                                  "title={\"a\\u2028b\"} in a JSX attribute, or delete it")))
     write_new_file(canary_root / SEMGREP_IGNORE, b"")
     for c in semgrep_canaries():
         write_new_file(canary_root / c["file"], c["content"].encode())
@@ -2806,7 +3333,7 @@ def run_semgrep(s: Scan) -> dict:
     fetch_record = {"argv": fetch_argv, "network": "default", "exit_code": fetch.code if fetch.code is not None else -1,
                     "retried": fetch.retried, "duration_s": fetch.duration}
     fetched = [] if fetch.code == 0 else [
-        ("offline_db", f"the Semgrep Registry download {fetch.detail or f'exited {fetch.code}'}")]
+        (reason("offline_db"), f"the Semgrep Registry download {fetch.detail or f'exited {fetch.code}'}")]
     rulesets, configs, registry_given, registry_ids = [], [], 0, set()
     for rs in spec["rulesets"]:
         entry = {"name": rs["name"], "source": rs["source"], "sha256": None, "rules": None, "min_rules": rs["min_rules"]}
@@ -2817,25 +3344,25 @@ def run_semgrep(s: Scan) -> dict:
                 raise OSError("missing")
             data = path.read_bytes()
         except OSError:
-            fetched.append(("offline_db", f"the {rs['name']} ruleset was not downloaded or cannot be read"))
+            fetched.append((reason("offline_db"), f"the {rs['name']} ruleset was not downloaded or cannot be read"))
             continue
         count, ids = ruleset_rules(data)
         entry.update(sha256=sha256_hex(data), rules=count)
         if count < rs["min_rules"]:
-            fetched.append(("offline_db", (f"the {rs['name']} ruleset has {count} rule(s), fewer than min_rules "
-                                           f"{rs['min_rules']} of lock.json")))
+            fetched.append((reason("offline_db"), (f"the {rs['name']} ruleset has {count} rule(s), fewer than min_rules "
+                                                   f"{rs['min_rules']} of lock.json")))
         # Of rules with one id in one call, semgrep 1.179.0 may drop all but
         # the last on files without the text the last one looks for: a rule
         # under the id of a pinned rule could silence it on the head and
         # still trip its canary. Ids are unique in the call of the Registry.
         if len(ids) != count:
-            fetched.append(("offline_db", (f"the {rs['name']} ruleset has {count - len(ids)} rule(s) under an id "
-                                           f"that another of its rules has: semgrep would drop such a rule on "
-                                           f"some files without a word")))
+            fetched.append((reason("offline_db"), (f"the {rs['name']} ruleset has {count - len(ids)} rule(s) under an id "
+                                                   f"that another of its rules has: semgrep would drop such a rule on "
+                                                   f"some files without a word")))
         if ids & registry_ids:
-            fetched.append(("offline_db", (f"the {rs['name']} ruleset has {len(ids & registry_ids)} rule id(s) of "
-                                           f"another downloaded ruleset: semgrep would drop such a rule on some "
-                                           f"files without a word")))
+            fetched.append((reason("offline_db"), (f"the {rs['name']} ruleset has {len(ids & registry_ids)} rule id(s) of "
+                                                   f"another downloaded ruleset: semgrep would drop such a rule on some "
+                                                   f"files without a word")))
         if count:
             configs += ["--config", f"registry/{rs['name']}.yml"]
             registry_given += count
@@ -2961,7 +3488,7 @@ def new_receipt() -> dict:
 
 
 def add_reason(receipt: dict, code: str, detail: str, tool: str | None = None) -> None:
-    receipt["reasons"].append({"code": code, "tool": tool, "detail": detail})
+    receipt["reasons"].append({"code": reason(code), "tool": tool, "detail": detail})
 
 
 def read_event(receipt: dict) -> dict:
@@ -2973,12 +3500,12 @@ def read_event(receipt: dict) -> dict:
         info = {"number": pr["number"], "head_sha": pr["head"]["sha"],
                 "default_branch": event["repository"]["default_branch"]}
     except (OSError, ValueError, KeyError, TypeError):
-        add_reason(receipt, "invalid_document", "the event payload (GITHUB_EVENT_PATH) is missing or not a "
-                                                "pull_request_target payload")
+        add_reason(receipt, reason("invalid_document"), "the event payload (GITHUB_EVENT_PATH) is missing or not a "
+                                                        "pull_request_target payload")
         return {}
     if not (isinstance(info["number"], int) and isinstance(info["head_sha"], str)
             and isinstance(info["default_branch"], str)):
-        add_reason(receipt, "invalid_document", "the event payload has fields of an unexpected type")
+        add_reason(receipt, reason("invalid_document"), "the event payload has fields of an unexpected type")
         return {}
     return info
 
@@ -2988,15 +3515,15 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     trusted = Git(args.trusted, scratch / "trusted")
     git = Git(args.tree, scratch / "pr")
     if trusted.object_format() != "sha1" or git.object_format() != "sha1":
-        add_reason(receipt, "unsupported_object_format", "the repository does not use SHA-1 object ids")
+        add_reason(receipt, reason("unsupported_object_format"), "the repository does not use SHA-1 object ids")
         return
     event = read_event(receipt)
     head = os.getenv("PR_HEAD_SHA", "")
     if not SHA1_RE.match(head):
-        add_reason(receipt, "invalid_document", "PR_HEAD_SHA is not a 40-hex commit id")
+        add_reason(receipt, reason("invalid_document"), "PR_HEAD_SHA is not a 40-hex commit id")
         return
     if event and event["head_sha"] != head:
-        add_reason(receipt, "invalid_document", "PR_HEAD_SHA differs from the head in the event payload")
+        add_reason(receipt, reason("invalid_document"), "PR_HEAD_SHA differs from the head in the event payload")
         return
     sub = receipt["subject"]
     sub["head_sha"] = head
@@ -3018,19 +3545,19 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
         failed.append("runner_environment")
     receipt["self_check"] = {"outcome": INCONCLUSIVE if failed else PASS, "failed": failed}
     if failed:
-        add_reason(receipt, "self_check_failed", "not the owned workflow on pull_request_target from the default "
-                                                 "branch on a GitHub-hosted runner: " + ", ".join(failed))
+        add_reason(receipt, reason("self_check_failed"), "not the owned workflow on pull_request_target from the default "
+                                                         "branch on a GitHub-hosted runner: " + ", ".join(failed))
 
     try:
         git.rev(head)
         git.rev(gate_sha)
     except GitError:
-        add_reason(receipt, "tool_error", "the head or the default branch commit is not in the pull request "
-                                          "checkout")
+        add_reason(receipt, reason("tool_error"), "the head or the default branch commit is not in the pull request "
+                                                  "checkout")
         return
     base = git.merge_base(gate_sha, head)
     if base is None:
-        add_reason(receipt, "tool_error", "the head has no merge base with the default branch")
+        add_reason(receipt, reason("tool_error"), "the head has no merge base with the default branch")
         return
     sub["merge_base"] = base
     sub["commits"] = git.count(base, head)
@@ -3041,8 +3568,8 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     changed, bad_changed = protected_changes(git, gate_sha, head)
     bad = sorted(set(bad + bad_changed))
     if bad:
-        add_reason(receipt, "non_utf8_path", f"{len(bad)} path(s) are not UTF-8, for example "
-                                             + shown(bad[0].decode("utf-8", "backslashreplace")))
+        add_reason(receipt, reason("non_utf8_path"), f"{len(bad)} path(s) are not UTF-8, for example "
+                                                     + shown(bad[0].decode("utf-8", "backslashreplace")))
 
     oids = sorted({e.oid for e in entries if e.kind == "blob"})
     blobs = git.blobs(oids)
@@ -3050,8 +3577,8 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     # SG-TRUST-001
     confirmed_set, well_formed = parse_config(os.getenv("SG_CONFIG"))
     if not well_formed:
-        add_reason(receipt, "invalid_document", f"{CONFIG_VARIABLE} is set but is not one sha256:<64 hex> "
-                                                "fingerprint")
+        add_reason(receipt, reason("invalid_document"), f"{CONFIG_VARIABLE} is set but is not one sha256:<64 hex> "
+                                                        "fingerprint")
     fp = fingerprint(entries, blobs)
     changed_paths = [path for _, path in changed]
     special = unconfirmable(entries)
@@ -3061,16 +3588,16 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     tr["confirmed"] = confirmed
 
     if changed_paths and not confirmed:
-        detail = (f"{len(changed_paths)} protected path(s) differ from the default branch and the head "
-                  f"fingerprint is not confirmed in {CONFIG_VARIABLE}: " + listed(changed_paths))
         stale = behind(git, gate_sha, head)
+        detail = (f"{len(changed_paths)} protected path(s) differ from the default branch and the head "
+                  f"fingerprint is not confirmed in {CONFIG_VARIABLE}: " + listed(changed_paths, "." if stale else ""))
         if stale:
-            detail += (f". The default branch changed {len(stale)} protected path(s) after this branch was "
+            detail += (f" The default branch changed {len(stale)} protected path(s) after this branch was "
                        f"created ({listed(stale)}): merge or rebase the default branch into the pull request "
                        f"first")
-        add_reason(receipt, "protected_change_unconfirmed", detail)
+        add_reason(receipt, reason("protected_change_unconfirmed"), detail)
     if special:
-        add_reason(receipt, "protected_change_unconfirmed",
+        add_reason(receipt, reason("protected_change_unconfirmed"),
                    f"{len(special)} protected path(s) are symlinks or submodules, whose content is outside the "
                    f"protected set; they cannot be confirmed, remove them: " + listed(special))
     sg001 = INCONCLUSIVE if special or (changed_paths and not confirmed) else PASS
@@ -3120,7 +3647,7 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
         try:
             result = tool(scan)
         except (GitError, OSError) as exc:
-            add_reason(receipt, "tool_error", f"{type(exc).__name__}: {exc}" if isinstance(exc, GitError)
+            add_reason(receipt, reason("tool_error"), f"{type(exc).__name__}: {exc}" if isinstance(exc, GitError)
                        else f"{type(exc).__name__} while preparing the scan", name)
             continue
         receipt["tools"] += result.get("receipts") or ([result["receipt"]] if "receipt" in result else [])
@@ -3132,9 +3659,28 @@ def run_pr(args: argparse.Namespace, receipt: dict, scratch: Path) -> None:
     sub["canary_commit"] = scan.canary_commit
 
 
+def drop_made_up_codes(receipt: dict) -> None:
+    """The last barrier: a code outside REASONS that a line of this file wrote
+    straight into the receipt, past reason(), leaves it here. It is a bug of
+    the gate, so it is a tool_error, and the run is not a pass. The log names
+    the code, the receipt does not."""
+    tools = [t for t in receipt["tools"] if t["reason_code"] is not None and not is_reason(t["reason_code"])]
+    made = [t["reason_code"] for t in tools] + [r["code"] for r in receipt["reasons"] if not is_reason(r["code"])]
+    if not made:
+        return
+    for code in made:
+        print(f"security-gate: {made_up(code)}", file=sys.stderr)
+    for tool in tools:
+        tool["reason_code"] = reason("tool_error")
+        tool["outcome"] = FAIL if tool["outcome"] == FAIL else INCONCLUSIVE
+    receipt["reasons"] = [r for r in receipt["reasons"] if is_reason(r["code"])]
+    add_reason(receipt, reason("tool_error"), "internal error: a reason code outside REASONS in the receipt")
+
+
 def finish(receipt: dict) -> None:
+    drop_made_up_codes(receipt)
     if not receipt["tools"]:
-        add_reason(receipt, "tool_missing", "no tool produced a receipt")
+        add_reason(receipt, reason("tool_missing"), "no tool produced a receipt")
     codes = {r["code"] for r in receipt["reasons"]}
     parts = [receipt["self_check"]["outcome"], receipt["coverage"]["outcome"], receipt["exceptions"]["outcome"]]
     parts += [t["outcome"] for t in receipt["trust_checks"]] + [t["outcome"] for t in receipt["tools"]]
@@ -3145,7 +3691,7 @@ def finish(receipt: dict) -> None:
     else:
         outcome = PASS
     if outcome != PASS and not receipt["reasons"]:
-        add_reason(receipt, "tool_error", "a check is not pass but gave no reason")
+        add_reason(receipt, reason("tool_error"), "a check is not pass but gave no reason")
     receipt["outcome"] = outcome
     receipt["exit_code"] = EXIT[outcome]
     receipt["finished_at"] = now()
@@ -3178,9 +3724,21 @@ NOT_CHECKED = ("composite actions, dependabot.yml and anything else outside .git
                "before = in an environment file, in an import from $env/static/public or $env/dynamic/public and "
                "in a workflow; the variable a public one is fed from, but for $X and ${X} as the whole value, "
                "process.env.X and a secret, variable or env of a workflow, whose names are read; whether a public "
-               "key the gate does not know as publishable is a secret (sg-public-key only warns); row level "
-               "security of Supabase migrations and Firebase rules; new packages (whether they exist and how old "
-               "they are)")
+               "key the gate does not know as publishable is a secret (sg-public-key only warns); a Supabase "
+               "service or secret key read outside a \"use client\" file (but through import.meta.env), in a .astro "
+               "file or in a form sg-service-role-client has no pattern for, such as an alias, the whole object, "
+               "another file, Vite define, a directive semgrep cannot parse or a comment before the key in a "
+               "destructuring of a component; row level security of Supabase but tables of public that "
+               "supabase/migrations leave without it and policies "
+               "FOR ALL or DELETE, or FOR UPDATE without WITH CHECK or with WITH CHECK (true), to PUBLIC or anon with USING (true) (not "
+               "other always true expressions, other schemas, views, materialized and foreign tables, security definer functions, policies of Storage and of "
+               "authenticated, dynamic SQL but a loop over pg_tables, tables made in the dashboard or by other tools, migrations outside supabase/migrations); "
+               "Firebase rules but in files named *.rules and *.rules.json, and there but a write open to everyone, access open to everyone or "
+               "any signed-in user at the root of the Realtime Database or at a match of every document (not a read "
+               "of every file of Cloud Storage) and an update or delete (not a create) open to any signed-in user at "
+               "a match of a user's document by the name of its wildcard, written as true, no condition, a test-mode "
+               "date or auth != null, not in what the matcher of a *.rules file takes for a comment: // to LF, past "
+               "a bare CR, and /* to */, in a string too; new packages (whether they exist and how old they are)")
 
 
 def config_notice(receipt: dict) -> str | None:
@@ -3263,10 +3821,14 @@ def cmd_pr(args: argparse.Namespace) -> int:
         try:
             run_pr(args, receipt, Path(tmp))
         except GitError as exc:
-            add_reason(receipt, "tool_error", str(exc))
+            add_reason(receipt, reason("tool_error"), str(exc))
         except Exception as exc:  # noqa: BLE001 - a crash is inconclusive, never pass
-            frame = traceback.extract_tb(exc.__traceback__)[-1]
-            add_reason(receipt, "tool_error", f"internal error {type(exc).__name__} at line {frame.lineno}")
+            frames = traceback.extract_tb(exc.__traceback__)
+            if isinstance(exc, ReasonError):
+                # The line that gave the code: these only pass it on.
+                frames = [f for f in frames if f.name not in (reason.__name__, add_reason.__name__, tool_receipt.__name__)]
+                print(f"security-gate: {exc}", file=sys.stderr)
+            add_reason(receipt, reason("tool_error"), f"internal error {type(exc).__name__} at line {frames[-1].lineno}")
     finish(receipt)
     out = Path(args.out) if args.out else Path(os.getenv("RUNNER_TEMP") or ".") / "security-gate"
     try:
@@ -3347,6 +3909,7 @@ def cmd_protected_diff(args: argparse.Namespace) -> int:
 # GitHub does not show by id (404, as it may for one set above the
 # repository), or whose answer has no rules, may stop the gate: "blocked".
 POLICY_NAME = "security-gate: pull_request_target only for security-gate.yml"
+POLICY_API = "X-GitHub-Api-Version: 2026-03-10"   # the header of every call of the Actions policies
 POLICY_SOURCE = "Repository"
 # Enforcement levels under which a policy stops nothing; any other value, a
 # missing one included, may block.
@@ -3462,16 +4025,17 @@ def _read_json(path: Path) -> object:
         raise ValueError(f"cannot read {path}: {exc.strerror}") from exc
 
 
-def read_policy_details(directory: Path, ids: list[int]) -> dict[int, object]:
-    """The answers of GET /repos/{owner}/{repo}/actions/policies/{id} that
-    human.sh saved in directory, by id: <id>.json, or an empty <id>.404 when
-    GitHub answered 404 (then None). Exactly one of the two for each id."""
+def read_details(directory: Path, ids: list[int]) -> dict[int, object]:
+    """The answers of GET by id that human.sh saved in directory, by id
+    (Actions policies, rulesets, jobs and runs): <id>.json, or an empty
+    <id>.404 when GitHub answered 404 (then None). Exactly one of the two for
+    each id."""
     details: dict[int, object] = {}
-    for policy_id in ids:
-        found, missing = directory / f"{policy_id}.json", directory / f"{policy_id}.404"
+    for item_id in ids:
+        found, missing = directory / f"{item_id}.json", directory / f"{item_id}.404"
         if found.is_file() == missing.is_file():
-            raise ValueError(f"policy #{policy_id} has not been read by id")
-        details[policy_id] = None if missing.is_file() else _read_json(found)
+            raise ValueError(f"#{item_id} has not been read by id")
+        details[item_id] = None if missing.is_file() else _read_json(found)
     return details
 
 
@@ -3568,7 +4132,7 @@ def cmd_actions_policy(args: argparse.Namespace) -> int:
     if args.ids is not None:
         lines = [str(policy_id) for policy_id in policy_ids(doc)]
     elif args.list is not None:
-        lines = policy_report(doc, read_policy_details(args.details, policy_ids(doc)))
+        lines = policy_report(doc, read_details(args.details, policy_ids(doc)))
     else:
         diffs = policy_differences(_check_policy(doc), name=True)
         lines = [f"state={'differs' if diffs else 'correct'}", f"policy={doc['id']}",
@@ -3578,10 +4142,579 @@ def cmd_actions_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+# The workflows of a repository, read as a small subset of YAML, standard
+# library only: what sv.py detect reads them with, and what human.sh ruleset
+# looks for a second source of the check with. A file outside the subset is
+# Undecidable, never guessed.
+class Undecidable(Exception):
+    pass
+
+
+CHECK_NAME = "security-gate"  # the required check; a job of this name in another workflow can imitate it
+# A key and its value. The key's parts are possessive (*+): nothing is given
+# back, so a long line without a colon costs linear time, not quadratic. A
+# plain key keeps the blanks before its colon; key() strips them.
+_PAIR = re.compile(r"(\"[^\"]*\"|'[^']*'|[^\s\"'#&*!|>%@`{}\[\],?:-][^:]*+|-[^\s:][^:]*+)\s*+:(?:\s+(.*))?")
+_BLOCK = re.compile(r"[|>][0-9+-]*")
+# A line break of YAML that logical_lines, which splits on LF, would not see.
+_OTHER_BREAK = re.compile("\r(?!\n)|[\x85\u2028\u2029]")
+_JOB_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,99}", re.ASCII)
+
+
+def unquote(text: str) -> str:
+    """A scalar without its quotes. In double quotes a backslash starts an
+    escape (\\u0069 is i) that this subset does not decode: undecidable."""
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'":
+        if text[0] == '"' and "\\" in text:
+            raise Undecidable
+        return text[1:-1]
+    return text
+
+
+def key(pair: re.Match) -> str:
+    return unquote(pair.group(1).rstrip())
+
+
+def strip_comment(text: str) -> str:
+    quote = None
+    for i, ch in enumerate(text):
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "\"'" and (i == 0 or text[i - 1] in " :[{,-"):
+            quote = ch
+        elif ch == "#" and (i == 0 or text[i - 1] in " \t"):
+            return text[:i]
+    return text
+
+
+def check_value(value: str) -> None:
+    """Undecidable for an anchor, an alias, a tag, a reserved indicator a
+    plain scalar may not start with, and a flow collection or a quoted
+    scalar that does not end on its line."""
+    if value[:1] in ("&", "*", "!", "%", "@", "`", ",", "]", "}") \
+            or (value[:1] in "[{" and value[-1:] != {"[": "]", "{": "}"}[value[0]]) \
+            or (value[:1] in "\"'" and (len(value) < 2 or value[-1] != value[0])):
+        raise Undecidable
+
+
+def logical_lines(text: str) -> list[tuple[int, str]]:
+    """(indent, text) of each line that carries YAML structure: comments,
+    blank lines and the content of block scalars dropped. Lines end at LF or
+    CRLF here, so a file with another line break of YAML is undecidable, and
+    so is a marker of a document with a node on its line."""
+    if _OTHER_BREAK.search(text):
+        raise Undecidable
+    out, block = [], None
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        body = line.lstrip(" ")
+        indent = len(line) - len(body)
+        if block is not None and (not body or indent > block):
+            continue
+        block = None
+        if body.startswith("\t"):
+            raise Undecidable
+        body = strip_comment(body).rstrip()
+        if not body:
+            continue
+        if body in ("---", "..."):
+            if out or body == "...":
+                raise Undecidable
+            continue
+        if body.startswith(("? ", "<<")) or re.match(r"(?:---|\.\.\.)[ \t]", body):
+            raise Undecidable
+        item = re.match(r"-(?:\s+|$)", body)
+        rest = body[item.end():] if item else body
+        pair = _PAIR.fullmatch(rest)
+        if pair and key(pair).startswith("<<"):
+            raise Undecidable
+        value = (pair.group(2) or "") if pair else rest
+        if value:
+            check_value(value)
+        out.append((indent, body))
+        if _BLOCK.fullmatch(value):  # key: |, - key: |, - |: the scalar is deeper than its key or its dash
+            block = indent + item.end() if pair and item else indent
+    return out
+
+
+def tree_of(lines: list[tuple[int, str]]) -> list[list]:
+    """Nodes [level, text, children]; a "- " item at its key's indent is that key's child."""
+    root: list = [-1.0, "", []]
+    stack = [root]
+    for indent, text in lines:
+        level = indent + (0.5 if text == "-" or text.startswith("- ") else 0.0)
+        while stack[-1][0] >= level:
+            stack.pop()
+        node = [level, text, []]
+        stack[-1][2].append(node)
+        stack.append(node)
+    return root[2]
+
+
+def mapping(nodes: list[list]) -> dict[str, tuple[str, list]]:
+    out = {}
+    for _, text, kids in nodes:
+        pair = _PAIR.fullmatch(text)
+        name = key(pair) if pair else None
+        if name is None or name in out:
+            raise Undecidable
+        out[name] = ((pair.group(2) or "").strip(), kids)
+    return out
+
+
+def job_name(entry: tuple[str, list] | None) -> str | None:
+    """The name of a job as its check run gets it, or None without one.
+    GitHub evaluates ${{ }} in a name, so a name with an expression that
+    could come out as CHECK_NAME (its text before the first ${{ and after
+    the last }} fit it) is undecidable; one that cannot stays as written."""
+    if entry is None:
+        return None
+    value, kids = entry
+    if kids or _BLOCK.fullmatch(value):
+        raise Undecidable
+    name = unquote(value) or None
+    if name is not None and "${{" in name:
+        head, tail = name.partition("${{")[0], name.rpartition("}}")[2]
+        if "}}" not in name or "${{" in tail:
+            tail = ""
+        if len(head) + len(tail) <= len(CHECK_NAME) and CHECK_NAME.startswith(head) and CHECK_NAME.endswith(tail):
+            raise Undecidable
+    return name
+
+
+def reports_gate_check(job_id: str, name: str | None) -> bool:
+    """Whether the check run of a job has the name of the gate's check."""
+    return name == CHECK_NAME or (name is None and job_id == CHECK_NAME)
+
+
+def gate_jobs(text: str) -> list[str]:
+    """The ids of the jobs of a workflow whose check run has the name of the
+    gate's check; Undecidable when the file is outside the subset."""
+    top = mapping(tree_of(logical_lines(text)))
+    value, kids = top.get("jobs", ("", []))
+    if value not in ("", "{}") or (value and kids):
+        raise Undecidable
+    found = []
+    for job_id, (job_value, job_kids) in mapping(kids).items():
+        if job_value or not _JOB_ID.fullmatch(job_id):
+            raise Undecidable
+        if reports_gate_check(job_id, job_name(mapping(job_kids).get("name"))):
+            found.append(job_id)
+    return found
+
+
+# The ruleset of the gate (human.sh ruleset; docs/contracts/ruleset.md). It
+# makes the check security-gate of the app github-actions required on the
+# default branch, every change a pull request, and neither a force push nor
+# a deletion possible, with nobody in its bypass list (ADR 0003, 3.4). human.sh
+# reads GitHub and asks this code what to do; sv.py doctor asks the same code.
+# Every answer of GitHub is read as data, and nothing here calls anything.
+#
+# GitHub's list of rulesets gives a summary of each one, as its list of Actions
+# policies does: no conditions, rules or bypass list (S4: 620 bytes for one
+# ruleset, 1693 by id). So a ruleset is judged only from its answer by id.
+RULESET_NAME = "security-gate"
+RULESET_SOURCE = "Repository"
+INTEGRATION_ID = 15368   # the app github-actions (S4)
+RULESET_PAGE = 100
+# What an answer by id must show of a ruleset to tell whether it holds the gate.
+RULESET_SHOWN = (("enforcement", str), ("target", str), ("conditions", dict), ("rules", list), ("bypass_actors", list))
+# What takes the default branch in a ruleset's conditions, besides refs/heads/<its name>.
+RULESET_REACH = ("~DEFAULT_BRANCH", "~ALL")
+OWNER_ROLE = 5   # actor_id of the repository role admin, for a bypass of actor_type RepositoryRole
+# The owned workflow of this release as the pin mask leaves it (mask_pins):
+# sha256 of the template, kept equal to it by a test. A release that changes
+# the workflow, its managed-by line too, changes this value.
+OWNED_WORKFLOW_SHA256 = "sha256:52f568f70307d2a25d78f979aaaadbaeadc31411ddf07ee85e9450fc7019dd26"
+# A uses: line of the owned workflow pinned to a commit, and its comment:
+# Dependabot moves both. The name of the action is not masked, and the
+# comment only while it is printable ASCII: each line break of YAML but LF (a
+# lone CR, NEL, LS, PS) is CR or not ASCII, so the mask never drops one, nor
+# what a YAML parser would read after it.
+_PIN = re.compile(rb"^([ \t]*(?:-[ \t]+)?uses:[ \t]*[^\s@#\"']+@)[0-9a-f]{40}(?:[ \t]+#[\t\x20-\x7e]*)?$",
+                  re.MULTILINE)
+
+
+def mask_pins(data: bytes) -> bytes:
+    """A workflow with the pin and the comment of each uses: line replaced."""
+    return _PIN.sub(rb"\g<1>" + b"0" * 40, data)
+
+
+def ruleset_body() -> dict:
+    """The request body of the ruleset (ADR 0003, 3.4; strict false by the
+    maintainer's answer 6). S4 created and read back these rules."""
+    return {"name": RULESET_NAME, "target": "branch", "enforcement": "active", "bypass_actors": [],
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [{"type": "required_status_checks", "parameters": {
+                          "required_status_checks": [{"context": CHECK_NAME, "integration_id": INTEGRATION_ID}],
+                          "strict_required_status_checks_policy": False, "do_not_enforce_on_create": False}},
+                      {"type": "pull_request", "parameters": {
+                          "required_approving_review_count": 0, "dismiss_stale_reviews_on_push": False,
+                          "require_code_owner_review": False, "require_last_push_approval": False,
+                          "required_review_thread_resolution": False}},
+                      {"type": "non_fast_forward"}, {"type": "deletion"}]}
+
+
+def is_number(value: object, number: int) -> bool:
+    """Whether a value of GitHub's answer is this integer. To == the JSON
+    values true and 15368.0 are 1 and 15368, and GitHub writes neither."""
+    return type(value) is int and value == number
+
+
+def _has_gate_check(rule: object) -> bool:
+    """Whether a rule requires the check of the gate from github-actions."""
+    params = rule.get("parameters") if isinstance(rule, dict) else None
+    pairs = params.get("required_status_checks") if isinstance(params, dict) else None
+    return isinstance(rule, dict) and rule.get("type") == "required_status_checks" and isinstance(pairs, list) \
+        and any(isinstance(p, dict) and p.get("context") == CHECK_NAME and is_number(p.get("integration_id"), INTEGRATION_ID)
+                for p in pairs)
+
+
+def bypass_wider(actors: list) -> list[str]:
+    """The entries of a bypass list wider than the owner, each as ASCII JSON:
+    anything but the organization's owners and the repository's admin role."""
+    return [json.dumps(a, sort_keys=True) for a in actors if not isinstance(a, dict) or not (
+        a.get("actor_type") == "OrganizationAdmin"
+        or (a.get("actor_type") == "RepositoryRole" and is_number(a.get("actor_id"), OWNER_ROLE)))]
+
+
+def ruleset_weak(ruleset: dict, default: str) -> list[str]:
+    """Why a ruleset, as GitHub answers by id, does not hold the gate on the
+    default branch, one line each; none when it does. A ruleset that also asks
+    for more holds it: only what is missing counts, whatever its name."""
+    out = [f"{name} is {json.dumps(ruleset.get(name), sort_keys=True)}"
+           for name, want in (("enforcement", "active"), ("target", "branch")) if ruleset.get(name) != want]
+    conditions = ruleset.get("conditions")
+    refs = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    include, exclude = (refs.get("include"), refs.get("exclude")) if isinstance(refs, dict) else (None, None)
+    if not isinstance(include, list) or exclude != [] \
+            or not any(ref in include for ref in (*RULESET_REACH, "refs/heads/" + default)):
+        out.append(f"conditions is {json.dumps(conditions, sort_keys=True)}")
+    rules = ruleset.get("rules")
+    rules = rules if isinstance(rules, list) else []
+    kinds = [rule.get("type") for rule in rules if isinstance(rule, dict)]
+    if not any(_has_gate_check(rule) for rule in rules):
+        out.append(f"no rule requires the check {CHECK_NAME} of the app {INTEGRATION_ID}")
+    out += [f"no rule of the type {kind}" for kind in ("pull_request", "non_fast_forward", "deletion")
+            if kind not in kinds]
+    actors = ruleset.get("bypass_actors")
+    wider = bypass_wider(actors) if isinstance(actors, list) else [json.dumps(actors, sort_keys=True)]
+    out += [f"bypass_actors has {actor}" for actor in wider]
+    return out
+
+
+def _check_ruleset(ruleset: object) -> dict:
+    if not isinstance(ruleset, dict) or type(ruleset.get("id")) is not int or ruleset["id"] < 1 \
+            or not isinstance(ruleset.get("name"), str):
+        raise ValueError("a ruleset without an id or a name")
+    return ruleset
+
+
+def _array(doc: object, what: str) -> list:
+    if isinstance(doc, list):
+        return doc
+    raise ValueError(f"not a list of {what}")
+
+
+def _ruleset_list(doc: object) -> list[dict]:
+    """The rulesets of a list answer (GET /repos/{owner}/{repo}/rulesets, one
+    page), each a summary. The answer is an array with no count, so a full
+    page may hide more: it is not read."""
+    if len(_array(doc, "rulesets")) >= RULESET_PAGE:
+        raise ValueError(f"the answer lists {len(doc)} rulesets; more than one page is not read")
+    rulesets = [_check_ruleset(r) for r in doc]
+    ids = [r["id"] for r in rulesets]
+    if len(set(ids)) != len(ids):
+        raise ValueError("the answer lists a ruleset twice")
+    return rulesets
+
+
+def ruleset_ids(doc: object) -> list[int]:
+    """The ids of a list answer, in its order: human.sh reads each one by id."""
+    return [r["id"] for r in _ruleset_list(doc)]
+
+
+def _ruleset_label(ruleset: dict) -> str:
+    return (f"#{ruleset['id']} {shown(ruleset['name'])} (source {json.dumps(ruleset.get('source_type'))}, "
+            f"enforcement {json.dumps(ruleset.get('enforcement'))})")
+
+
+def ruleset_report(doc: object, details: dict[int, object], default: str) -> list[str]:
+    """What human.sh does with the repository's rulesets: doc is the list
+    answer, details the answer of GET .../rulesets/{id} for each listed id,
+    None where GitHub answered 404. A ruleset is judged from its answer by id
+    only. The first line says what to do:
+
+    state=absent   no ruleset holds the gate and none has its name: create it
+    state=correct  a ruleset holds the gate (ruleset_weak), under its name or
+                   another: nothing
+    state=differs  the ruleset of its name does not hold the gate and none
+                   other does: stop; it is the person's, and this code never
+                   changes it
+
+    then ruleset=<id> (empty without one), lines "differs:" and "note:" and,
+    last of a ruleset that holds the gate, bypass=owner or bypass=none: whether
+    its bypass list lets the owner past a red check.
+    An answer that does not show what ruleset_weak reads of the ruleset of its
+    name tells nothing: ValueError, so that nobody reads it as weak or as
+    absent. Only a ruleset of the repository itself has the gate's name; one
+    of an organization or enterprise is someone else's: that, its source, is
+    all that is taken from the list."""
+    holding: list[dict] = []
+    own: list[tuple[dict, list[str]]] = []
+    lines: list[str] = []
+    for entry in _ruleset_list(doc):
+        if entry["id"] not in details:
+            raise ValueError(f"ruleset #{entry['id']} has not been read by id")
+        detail = details[entry["id"]]
+        mine = entry.get("source_type") == RULESET_SOURCE
+        if detail is None:
+            if mine:
+                raise ValueError(f"ruleset #{entry['id']} of the repository is listed, but GitHub does not find it "
+                                 "by id; run again")
+            lines.append(f"note:  {_ruleset_label(entry)} cannot be read by id (HTTP 404): it is not counted")
+            continue
+        if _check_ruleset(detail)["id"] != entry["id"]:
+            raise ValueError(f"GitHub answered for ruleset #{entry['id']} with ruleset #{detail['id']}")
+        ruleset = {**detail, "source_type": entry.get("source_type")}
+        named = mine and ruleset["name"] == RULESET_NAME
+        if named and not all(isinstance(ruleset.get(field), kind) for field, kind in RULESET_SHOWN):
+            raise ValueError(f"GitHub's answer does not show what ruleset #{entry['id']} holds")
+        weak = ruleset_weak(ruleset, default)
+        if not weak:
+            holding.append(ruleset)
+        elif named:
+            own.append((ruleset, weak))
+    if holding:
+        ours = [r for r in holding if r.get("source_type") == RULESET_SOURCE and r["name"] == RULESET_NAME]
+        first = ours[0] if ours else holding[0]
+        if not ours:
+            lines.append(f"note:  {_ruleset_label(first)} holds the gate under another name")
+        if first.get("bypass_actors"):
+            lines.append(f"note:  {_ruleset_label(first)} lets the owner bypass it")
+        return ["state=correct", f"ruleset={first['id']}", *lines, f"bypass={'owner' if first.get('bypass_actors') else 'none'}"]
+    if own:
+        ruleset, weak = own[0]
+        return ["state=differs", f"ruleset={ruleset['id']}", *[f"differs:  {line}" for line in weak], *lines]
+    return ["state=absent", "ruleset=", *lines]
+
+
+def ruleset_applies(doc: object, ruleset_id: int) -> bool:
+    """Whether the answer of GET .../rules/branches/{default} has the check of
+    the gate from the ruleset of this id."""
+    return any(_has_gate_check(rule) and is_number(rule.get("ruleset_id"), ruleset_id)
+               for rule in _array(doc, "the rules of a branch"))
+
+
+def last_gate_run(doc: object) -> dict | None:
+    """The newest finished run in an answer of GET .../actions/workflows/
+    security-gate.yml/runs, newest first. A run that did not end in success or
+    failure (cancelled, or stopped before its job started) proves nothing of
+    the gate: its job may have no runner. None without such a run. A page may
+    hold fewer runs than total_count, but never none of them and never more:
+    an answer of another form is no "nothing on record"."""
+    runs = _array(doc.get("workflow_runs") if isinstance(doc, dict) else None, "workflow runs")
+    total = doc.get("total_count")
+    if type(total) is not int or total < len(runs) or (total and not runs):
+        raise ValueError(f"the answer lists {len(runs)} of {total!r} workflow runs")
+    for run in runs:
+        if not isinstance(run, dict) or not isinstance(run.get("head_sha"), str) \
+                or SHA1_RE.fullmatch(run["head_sha"]) is None:
+            raise ValueError("a workflow run without a head commit")
+        if run.get("status") == "completed" and run.get("conclusion") in ("success", "failure"):
+            return run
+    return None
+
+
+def gate_check_runs(doc: object) -> list[dict]:
+    """The check runs of the gate's name in an answer of GET .../commits/{sha}/
+    check-runs, one page."""
+    runs = doc.get("check_runs") if isinstance(doc, dict) else None
+    if not isinstance(runs, list) or type(doc.get("total_count")) is not int:
+        raise ValueError("not a list of check runs")
+    if doc["total_count"] != len(runs):
+        raise ValueError(f"the answer lists {len(runs)} of {doc['total_count']} check runs; more than one page is "
+                         "not read")
+    if not all(isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0 and isinstance(r.get("name"), str)
+               for r in runs):
+        raise ValueError("a check run without an id or a name")
+    return [r for r in runs if r["name"] == CHECK_NAME]
+
+
+def app_of(check: dict) -> object:
+    """The id of the app of a check run."""
+    return check["app"].get("id") if isinstance(check.get("app"), dict) else None
+
+
+def of_the_gate_s_app(check: dict) -> bool:
+    return is_number(app_of(check), INTEGRATION_ID)
+
+
+def gate_statuses(doc: object) -> int:
+    """How many commit statuses have the gate's name in an answer of GET
+    .../commits/{sha}/status, one page. A status of that name counts as a
+    check of the app github-actions in a ruleset (X07b): no gate writes one."""
+    statuses = doc.get("statuses") if isinstance(doc, dict) else None
+    if not isinstance(statuses, list) or type(doc.get("total_count")) is not int:
+        raise ValueError("not a combined status")
+    if doc["total_count"] != len(statuses):
+        raise ValueError(f"the answer lists {len(statuses)} of {doc['total_count']} statuses; more than one page is "
+                         "not read")
+    return sum(1 for s in statuses if not isinstance(s, dict) or s.get("context") == CHECK_NAME)
+
+
+def check_run_problems(check: dict, job: object, run: object, head: str) -> list[str]:
+    """Why a check run of the gate's name on head is not a run of the gate,
+    from the answers of GET .../actions/jobs/{check id} and .../actions/runs/
+    {run id} (None for a 404); none when it is. X02-neg: a check run made
+    with a token of the same app lands in the check suite of the real run, so
+    only the job tells them apart: runner_name not null, steps > 0."""
+    out = [] if of_the_gate_s_app(check) else [f"its app is {json.dumps(app_of(check))}"]
+    if check.get("head_sha") != head:
+        out.append("it is on another commit")
+    if not isinstance(job, dict):
+        return [*out, "it has no job"]
+    if job.get("head_sha") != head:
+        out.append("its job is of another commit")
+    runner, steps = job.get("runner_name"), job.get("steps")
+    if not isinstance(runner, str) or not runner:
+        out.append("its job has no runner")
+    if not isinstance(steps, list) or not steps:
+        out.append("its job has no steps")
+    if not isinstance(run, dict) or type(job.get("run_id")) is not int or not is_number(run.get("id"), job["run_id"]):
+        return [*out, "it has no run"]
+    if run.get("path") != WORKFLOW_PATH:
+        out.append(f"its run is of the workflow {json.dumps(run.get('path'))}")
+    if run.get("event") != EVENT:
+        out.append(f"its run is of the event {json.dumps(run.get('event'))}")
+    if run.get("head_sha") != head:
+        out.append("its run is of another commit")
+    return out
+
+
+def workflow_stops(git: Git, commit: str) -> list[str]:
+    """What human.sh ruleset stops on in the tree of the default branch: the
+    owned workflow not as the template of this release (pins masked, mode
+    100644; bytes that cannot be read, larger than the gate reads, are not
+    those), and a job of another workflow with the name of the gate's check,
+    or a workflow that cannot be read to tell."""
+    out = []
+    entry = git.entry_at(commit, WORKFLOW_PATH)
+    try:
+        template = entry is not None and entry[:2] == ("100644", "blob") \
+            and sha256_hex(mask_pins(git.blob_bytes(entry[2], MAX_GATE_BYTES))) == OWNED_WORKFLOW_SHA256
+    except GitError:
+        template = False
+    if not template:
+        out.append(f"stop:  workflow_not_template: {WORKFLOW_PATH} on the default branch is not the file of this "
+                   "release")
+    for mode, kind, oid, raw in git.tree(commit):
+        path = raw.decode("utf-8", "surrogateescape")
+        if path == WORKFLOW_PATH or not _WORKFLOW_FILE.match(path):
+            continue
+        try:
+            if mode not in FILE_MODES or kind != "blob":
+                raise Undecidable
+            jobs = gate_jobs(git.blob_bytes(oid, MAX_GATE_BYTES).decode("utf-8-sig"))
+        except (Undecidable, UnicodeDecodeError, GitError):
+            out.append(f"stop:  other_security_gate_source: {shown(path)} cannot be read as a workflow, so it may "
+                       f"have a job named {CHECK_NAME}")
+            continue
+        out += [f"stop:  other_security_gate_source: {shown(path)} has the job {job} named {CHECK_NAME}" for job in jobs]
+    return out
+
+
+def run_stops(doc: object) -> list[str]:
+    """head=<the commit of the newest finished run of the gate>, or the stop of
+    a repository where the gate has no such run."""
+    run = last_gate_run(doc)
+    if run is None:
+        return ["head=", (f"stop:  no_gate_check_run: the gate has no finished run yet. Open a pull request, wait for "
+                          f"its {CHECK_NAME} check, then run this again")]
+    return [f"head={run['head_sha']}"]
+
+
+def job_run_ids(jobs: dict[int, object]) -> list[int]:
+    """The run of each job read (GET .../actions/jobs/{id}, None for a 404),
+    each once: human.sh reads these by id. A job without a run id of GitHub's
+    form has no run to read, and check_run_problems says so."""
+    ids = [job.get("run_id") for job in jobs.values() if isinstance(job, dict)]
+    return list(dict.fromkeys(i for i in ids if type(i) is int and i > 0))
+
+
+def evidence_stops(checks: object, statuses: object, head: str, jobs: dict[int, object],
+                   runs: dict[int, object]) -> list[str]:
+    """What human.sh ruleset stops on at the commit of that run: a check run
+    of the gate's name that is no run of its workflow, a commit status of that
+    name, and no check run that is one. jobs: the answer for each check run's
+    id, runs: for each id of job_run_ids, None for a 404. The chain is the one
+    doctor reads (check_run_problems)."""
+    out, proven = [], False
+    for check in gate_check_runs(checks):
+        job = jobs[check["id"]]
+        run_id = job.get("run_id") if isinstance(job, dict) else None
+        problems = check_run_problems(check, job, runs.get(run_id) if type(run_id) is int else None, head)
+        proven = proven or not problems
+        if problems:
+            out.append(f"stop:  other_security_gate_source: check run #{check['id']} on {head} is no run of the gate's "
+                       f"workflow: {'; '.join(problems)}. A run that has not finished or was cancelled reads so too: "
+                       "then wait for it, or push a new commit to the pull request")
+    if gate_statuses(statuses):
+        out.append(f"stop:  other_security_gate_source: a commit status named {CHECK_NAME} is on {head}")
+    if not proven:
+        out.append(f"stop:  no_gate_check_run: {head} has no check run {CHECK_NAME} of the app {INTEGRATION_ID} that is "
+                   "a run of the gate's workflow")
+    return out
+
+
+# What each mode of gate.py ruleset needs besides its own argument.
+RULESET_MODES = {"tree": ("repo", "commit"), "run_ids": ("jobs",), "checks": ("status", "head", "jobs", "job_runs"),
+                 "list": ("details", "default"), "one": ("default",), "applies": ("id",)}
+
+
+def read_jobs(checks: object, directory: Path) -> dict[int, object]:
+    """What human.sh saved in directory of each check run of the gate's name."""
+    return read_details(directory, [check["id"] for check in gate_check_runs(checks)])
+
+
+def cmd_ruleset(args: argparse.Namespace) -> int:
+    for mode, needed in RULESET_MODES.items():
+        if getattr(args, mode) not in (None, False) and any(getattr(args, name) is None for name in needed):
+            raise ValueError(f"--{mode} goes with --{' and --'.join(needed)}".replace("_", "-"))
+    if args.body:
+        print(json.dumps(ruleset_body(), indent=2))
+        return 0
+    if args.tree:
+        with tempfile.TemporaryDirectory(prefix="security-gate-") as tmp:
+            git = Git(args.repo, Path(tmp))
+            lines = workflow_stops(git, git.rev(args.commit))
+    elif args.runs is not None:
+        lines = run_stops(_read_json(args.runs))
+    elif args.check_ids is not None:
+        lines = [str(check["id"]) for check in gate_check_runs(_read_json(args.check_ids))]
+    elif args.run_ids is not None:
+        lines = [str(run_id) for run_id in job_run_ids(read_jobs(_read_json(args.run_ids), args.jobs))]
+    elif args.checks is not None:
+        doc = _read_json(args.checks)
+        jobs = read_jobs(doc, args.jobs)
+        lines = evidence_stops(doc, _read_json(args.status), args.head, jobs, read_details(args.job_runs, job_run_ids(jobs)))
+    elif args.ids is not None:
+        lines = [str(ruleset_id) for ruleset_id in ruleset_ids(_read_json(args.ids))]
+    elif args.list is not None:
+        doc = _read_json(args.list)
+        lines = ruleset_report(doc, read_details(args.details, ruleset_ids(doc)), args.default)
+    elif args.one is not None:
+        doc = _check_ruleset(_read_json(args.one))
+        weak = ruleset_weak(doc, args.default)
+        lines = [f"state={'differs' if weak else 'correct'}", f"ruleset={doc['id']}", *[f"differs:  {w}" for w in weak]]
+    else:
+        lines = [f"applies={'yes' if ruleset_applies(_read_json(args.applies), args.id) else 'no'}"]
+    for line in lines:
+        print(line)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    if sys.version_info < (3, 11):  # noqa: UP036 - the guard is for an interpreter older than the target
-        print("security-gate: INCONCLUSIVE - Python 3.11 or newer is required")
-        return EXIT[INCONCLUSIVE]
     parser = argparse.ArgumentParser(prog="gate.py", description="security-gate pull request gate")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("pr", help="judge the pull request (CI)")
@@ -3603,11 +4736,32 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--list", type=Path, help="judge the repository's policies (GET .../actions/policies)")
     mode.add_argument("--policy", type=Path, help="judge one policy as GitHub returned it")
     p.add_argument("--details", type=Path, help="with --list: the policies read by id (<id>.json, <id>.404)")
+    p = sub.add_parser("ruleset", help="the ruleset of the gate and what it needs first (human.sh)")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--body", action="store_true", help="print the request body of the ruleset")
+    mode.add_argument("--tree", action="store_true", help="what stops the ruleset in the tree of --commit in --repo")
+    mode.add_argument("--runs", type=Path, help="the head of the last run of the gate (GET .../workflows/.../runs)")
+    mode.add_argument("--check-ids", type=Path, help="print the ids of the gate's check runs (GET .../check-runs)")
+    mode.add_argument("--run-ids", type=Path, help="print the runs of the jobs of those check runs (--jobs)")
+    mode.add_argument("--checks", type=Path, help="what stops the ruleset at --head (GET .../check-runs, --status)")
+    mode.add_argument("--ids", type=Path, help="print the ids of a list of rulesets (GET .../rulesets)")
+    mode.add_argument("--list", type=Path, help="judge the repository's rulesets (GET .../rulesets)")
+    mode.add_argument("--one", type=Path, help="judge one ruleset as GitHub returned it")
+    mode.add_argument("--applies", type=Path, help="does --id reach the branch (GET .../rules/branches/...)")
+    p.add_argument("--repo", type=Path, help="with --tree: the repository")
+    p.add_argument("--commit", help="with --tree: the tip of the default branch")
+    p.add_argument("--status", type=Path, help="with --checks: the commit status (GET .../commits/.../status)")
+    p.add_argument("--head", help="with --checks: the commit of the run")
+    p.add_argument("--jobs", type=Path, help="with --run-ids and --checks: the jobs read by id (<id>.json, <id>.404)")
+    p.add_argument("--job-runs", type=Path, help="with --checks: the runs of those jobs read by id (<id>.json, <id>.404)")
+    p.add_argument("--details", type=Path, help="with --list: the rulesets read by id (<id>.json, <id>.404)")
+    p.add_argument("--default", help="with --list and --one: the name of the default branch")
+    p.add_argument("--id", type=int, help="with --applies: the id of the ruleset")
     args = parser.parse_args(argv)
     if args.command == "pr":
         return cmd_pr(args)
     commands = {"fingerprint": cmd_fingerprint, "protected-diff": cmd_protected_diff,
-                "actions-policy": cmd_actions_policy}
+                "actions-policy": cmd_actions_policy, "ruleset": cmd_ruleset}
     try:
         return commands[args.command](args)
     except (GitError, UnicodeDecodeError, ValueError) as exc:

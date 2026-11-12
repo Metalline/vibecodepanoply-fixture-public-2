@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b4 (owned)
+# managed-by: security-gate v0.1.0-b6 (owned)
 #
 # The security gate's own Semgrep rules. The gate runs them from the default
 # branch in a Semgrep call of their own, apart from the Semgrep Registry rules
@@ -162,7 +162,8 @@ rules:
 
   # The Supabase service_role key or a secret key (sb_secret_) bypasses row
   # level security. In code that runs in the browser or in the app it is
-  # everyone's key.
+  # everyone's key. Its name: service_role or service_key, or a secret key
+  # of Supabase (SUPABASE_SECRET_KEY, supabaseSecretKey), in any case.
   - id: sg-service-role-client
     languages: [javascript, typescript]
     severity: ERROR
@@ -170,43 +171,72 @@ rules:
       The Supabase service_role or secret key is used in code that runs in the
       browser or in the app, where anyone can read it and bypass row level
       security. Use it only in server code (route handlers, server actions,
-      edge functions) and rotate the key.
+      edge functions) and rotate the key. In server code of Astro, read it
+      through astro:env/server, and in tests through process.env, not
+      import.meta.env.
     metadata:
       category: security
       cwe: "CWE-798: Use of Hard-coded Credentials"
-    pattern-either:
-      # A Next.js client component reads the service key from the
-      # environment: code, not a comment or another string.
-      - patterns:
-          - pattern-inside: |
-              "use client";
-              ...
-          - pattern-either:
-              - pattern: process.env.$NAME
-              # The bracket form with a string, which process.env.$NAME
-              # does not match. env is a metavariable held to the exact
-              # name, so that the text of this file never has process.env
-              # next to an opening bracket: Hermes skills_guard scores that
-              # text high (node_process_env).
-              - patterns:
-                  - pattern: process.$FIELD["$NAME"]
-                  - metavariable-regex:
-                      metavariable: $FIELD
-                      regex: ^env$
-          - metavariable-regex:
-              metavariable: $NAME
-              regex: (?i).*service_?(?:role|key)
-      # Vite compiles import.meta.env into the browser bundle.
-      - patterns:
+    patterns:
+      - pattern-either:
+          # A Next.js client component reads the key from the environment:
+          # code, not a comment or another string. $P is process or
+          # globalThis.process (globalThis?.process too), with ?. after it,
+          # after env, after both or after neither, read by a dot, by
+          # brackets (a string, a template or a sum of strings) or in a
+          # destructuring, which names the key as a property, renamed or with
+          # a default; the pattern of a renamed one takes the shorthand too
+          # ({X} is {X: X}). Every pattern but $P.env.$NAME and
+          # $P.env?.$NAME has env as a metavariable held to the exact name, so
+          # that the text of this file never has process.env next to an
+          # opening bracket, which Hermes skills_guard scores high
+          # (node_process_env), nor env after a question mark and a dot,
+          # which layer 0 takes for the name of an environment file
+          # (L0-PAT-003).
+          - patterns:
+              - pattern-inside: |
+                  "use client";
+                  ...
+              - pattern-either:
+                  - patterns:
+                      - pattern-either:
+                          - pattern: $P.env.$NAME
+                          - pattern: $P.env?.$NAME
+                      - metavariable-regex: {metavariable: $P, regex: "^(?:globalThis\\??\\.)?process$"}
+                  - patterns:
+                      - pattern-either:
+                          - pattern: $P?.$FIELD.$NAME
+                          - pattern: $P?.$FIELD?.$NAME
+                          - pattern: $P.$FIELD["$NAME"]
+                          - pattern: $P?.$FIELD["$NAME"]
+                          - pattern: "{..., $NAME: $V, ...} = $P.$FIELD"
+                          - pattern: "{..., $NAME = $V, ...} = $P.$FIELD"
+                          - pattern: "{..., $NAME: $V, ...} = $P?.$FIELD"
+                          - pattern: "{..., $NAME = $V, ...} = $P?.$FIELD"
+                      - metavariable-regex: {metavariable: $P, regex: "^(?:globalThis\\??\\.)?process$"}
+                      - metavariable-regex: {metavariable: $FIELD, regex: ^env$}
+          # Vite compiles import.meta.env into the browser bundle, in each of
+          # these forms, for the names its envPrefix exposes.
           - pattern: import.meta.env.$NAME
-          - metavariable-regex:
-              metavariable: $NAME
-              regex: (?i).*service_?(?:role|key)
+          - pattern: import.meta.env?.$NAME
+          - pattern: import.meta.env["$NAME"]
+          - pattern: "{..., $NAME: $V, ...} = import.meta.env"
+          - pattern: "{..., $NAME = $V, ...} = import.meta.env"
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(?:service_?(?:role|key)|supabase_?secret)
   # Components of Vue and Svelte and the scripts of HTML pages run in the
   # browser too. semgrep has no JavaScript analyzer for them, so this entry
-  # reads their text ([.] is a dot); it reads no file the entry above reads.
-  # The name is bounded to 128 characters, as in the rules on public
-  # variables: a longer word after env and a dot would drop it in the file.
+  # reads their text ([.] is a dot), after a dot or ?. and in a
+  # destructuring, the name a word after a brace or a comma outside a
+  # string, blanks only between. Before the name in a destructuring it
+  # reads characters but braces, quotes and slashes, and strings in quotes
+  # with no brace in them, so a comment, an escaped quote or ${} before it
+  # hides the name (ADR 0006). It reads no file the entry above reads. The
+  # name is bounded to 128 characters, as in the rules on public variables:
+  # a longer word after env and a dot would drop it in the file; the braces
+  # to 1024. No bracket after env: with one the real semgrep parsed a file
+  # of UTF-16 for the entry above, which shares the id (ADR 0006).
   - id: sg-service-role-client
     languages: [regex]
     severity: ERROR
@@ -219,7 +249,9 @@ rules:
       cwe: "CWE-798: Use of Hard-coded Credentials"
     paths:
       include: ["*.vue", "*.svelte", "*.html", "*.htm"]
-    pattern-regex: \b(?:process|import[.]meta)[.]env[.](?![A-Za-z0-9_]{129})[A-Za-z0-9_]*(?i:service_?(?:role|key))
+    pattern-either:
+      - pattern-regex: \b(?:process|import[.]meta)[.]env[?]?[.](?![A-Za-z0-9_]{129})[A-Za-z0-9_]*(?i:service_?(?:role|key)|supabase_?secret)
+      - pattern-regex: \{(?=[^{}]{0,1024}+\})(?:(?:[^{}/"'`]|"[^"{}]*"|'[^'{}]*'|`[^`{}]*`)*?,)?\s*[A-Za-z0-9_]*(?i:service_?(?:role|key)|supabase_?secret)[^{}]*+\}\s*=\s*(?:process|import[.]meta)[.]env\b
 
   # The Supabase secret key (sb_secret_) or a service_role JWT itself,
   # written into any file of the repository: code of any language, config,
@@ -346,3 +378,188 @@ rules:
       - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_UPSTASH(?:_[A-Z0-9]+)*_READ_?ONLY_TOKEN)\b
       # the name of a storage key, not a credential
       - pattern-not-regex: \b(?![A-Za-z0-9_]{129})(?i:[A-Z0-9_]*_TOKEN(?:_STORAGE|_COOKIE|_PERSIST)?_KEY)\b
+
+  # Firebase security rules of Cloud Firestore and Cloud Storage that let
+  # anyone in, in a file named *.rules (firebase init writes firestore.rules
+  # and storage.rules): a write of any kind (write, create, update, delete)
+  # open to everyone, anywhere; any method open to everyone or to any
+  # signed-in user at a match of every document (/{name=**}) not nested in
+  # a match of one document; an update or delete (not a create) open to any
+  # signed-in user at a match of the document of a user (/users/{userId}
+  # and the like, by the name of its wildcard) and at a match below it,
+  # nested in it or in the same path (/users/{userId}/{allPaths=**},
+  # /users/{userId}/posts/{postId}), though not at every one: of
+  # /rooms/{roomId}/members/{memberId}/posts/{postId} it reads nothing
+  # (ADR 0006, item 52). Of
+  # Cloud Storage a read open to everyone at a match of every file is not
+  # reported, a public bucket may be meant (the maintainer, 08.11.2026), nor
+  # one open to any signed-in user. Open is true, true || ..., no condition,
+  # or the test-mode date of the console (request.time <
+  # timestamp.date(...)), whatever the date: the gate reads no clock. Signed
+  # in is request.auth != null or request.auth.uid != null, in parentheses
+  # or not. A generic rule: semgrep has no parser for the rules language,
+  # and its generic matcher skips a // comment to LF, past a bare CR, and a
+  # /* */ comment, also where one starts in a string. Not read: a condition
+  # in a function, any other condition that is always true, a statement
+  # without its semicolon, and what the matcher takes for a comment: the
+  # rest of a line after // in a string, and a line after a bare CR in a //
+  # comment, as the gate gives a *.rules file as it is (bare_cr.limits).
+  - id: sg-firebase-open-rules
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      These Firebase security rules let anyone in: the app's config, apiKey
+      included, ships to every visitor, and the rules are all that stands
+      between them and the data. Allow each read and write only to the user it
+      belongs to (request.auth.uid == userId), and deploy the rules.
+    metadata:
+      category: security
+      cwe: "CWE-284: Improper Access Control"
+    options:
+      generic_comment_style: cpp
+    paths:
+      include: ["*.rules"]
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: allow $...M;
+              - pattern: "allow $...M: if true;"
+              - pattern: "allow $...M: if (true);"
+              - pattern: "allow $...M: if true || $...C;"
+              - pattern: "allow $...M: if request.time < timestamp.date($...D);"
+          - metavariable-regex:
+              metavariable: $...M
+              regex: ^[a-z,\s]*\b(?:write|create|update|delete)\b[a-z,\s]*$
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  match /{$W=**} {
+                    ...
+                  }
+              - pattern-inside: |
+                  match /databases/{$D}/documents/{$W=**} {
+                    ...
+                  }
+          - pattern-not-inside: |
+              match /$...P/{$ID} {
+                ...
+              }
+          - pattern-not-inside: |
+              service firebase.storage {
+                ...
+              }
+          - pattern-either:
+              - pattern: allow $...M;
+              - pattern: "allow $...M: if true;"
+              - pattern: "allow $...M: if (true);"
+              - pattern: "allow $...M: if true || $...C;"
+              - pattern: "allow $...M: if request.time < timestamp.date($...D);"
+              - pattern: "allow $...M: if request.auth != null;"
+              - pattern: "allow $...M: if request.auth.uid != null;"
+              - pattern: "allow $...M: if (request.auth != null);"
+              - pattern: "allow $...M: if (request.auth.uid != null);"
+          - metavariable-regex:
+              metavariable: $...M
+              regex: ^[a-z,\s]+$
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  match /{$W=**} {
+                    ...
+                  }
+              - pattern-inside: |
+                  match /b/{$B}/o/{$W=**} {
+                    ...
+                  }
+          - pattern-not-inside: |
+              match /$...P/{$ID} {
+                ...
+              }
+          - pattern-either:
+              - pattern: "allow $...M: if request.auth != null;"
+              - pattern: "allow $...M: if request.auth.uid != null;"
+              - pattern: "allow $...M: if (request.auth != null);"
+              - pattern: "allow $...M: if (request.auth.uid != null);"
+          - metavariable-regex:
+              metavariable: $...M
+              regex: ^[a-z,\s]*\b(?:write|create|update|delete)\b[a-z,\s]*$
+      # The wildcard of a user ends the path, or a wildcard follows it, or a
+      # collection and a wildcard, or anything and a wildcard. The last takes
+      # the first wildcard of the path for $U, so {database} or {bucket} of a
+      # path written whole: the collection has a pattern of its own. An
+      # ellipsis of the generic matcher goes on past the end of the path into
+      # the next match, on its line too, so it holds no blank: a path has
+      # none, and the way to the next match has one (allow and its method).
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  match /$...P{$U} {
+                    ...
+                  }
+              - patterns:
+                  - pattern-inside: |
+                      match /$...P{$U}/{$...W} {
+                        ...
+                      }
+                  - metavariable-regex: {metavariable: $...W, regex: "^\\S*$"}
+              - patterns:
+                  - pattern-inside: |
+                      match /$...P{$U}/$C/{$...W} {
+                        ...
+                      }
+                  - metavariable-regex: {metavariable: $...W, regex: "^\\S*$"}
+              - patterns:
+                  - pattern-inside: |
+                      match /$...P{$U}/$...R/{$...W} {
+                        ...
+                      }
+                  - metavariable-regex: {metavariable: $...R, regex: "^\\S*$"}
+                  - metavariable-regex: {metavariable: $...W, regex: "^\\S*$"}
+          - metavariable-regex:
+              metavariable: $U
+              regex: (?i)^(?:user|uid|owner|account|profile|member)\w*$
+          - pattern-either:
+              - pattern: "allow $...M: if request.auth != null;"
+              - pattern: "allow $...M: if request.auth.uid != null;"
+              - pattern: "allow $...M: if (request.auth != null);"
+              - pattern: "allow $...M: if (request.auth.uid != null);"
+          - metavariable-regex:
+              metavariable: $...M
+              regex: ^[a-z,\s]*\b(?:write|update|delete)\b[a-z,\s]*$
+
+  # The rules of the Firebase Realtime Database, in a file named *.rules.json
+  # (firebase init writes database.rules.json; semgrep reads JSON with
+  # comments): a .write open to everyone anywhere, and a .read or .write of
+  # the root open to everyone or to any signed-in user. Open is true, "true"
+  # or the test-mode date "now < N", whatever N; signed in is "auth != null"
+  # or "auth.uid != null". Not read: a .read open below the root, a
+  # condition that is always true in another form.
+  - id: sg-firebase-open-database
+    languages: [json]
+    severity: ERROR
+    message: >-
+      These Firebase Realtime Database rules let anyone in: the app's config
+      ships to every visitor, and the rules are all that stands between them
+      and the data. Allow each read and write only to the user it belongs to
+      ("$uid === auth.uid"), and deploy the rules.
+    metadata:
+      category: security
+      cwe: "CWE-284: Improper Access Control"
+    paths:
+      include: ["*.rules.json"]
+    pattern-either:
+      - patterns:
+          - pattern: '{..., ".write": $V, ...}'
+          - metavariable-regex:
+              metavariable: $V
+              regex: ^(?:true|"\s*(?:true|now\s*<\s*[0-9]+)\s*")$
+          - focus-metavariable: $V
+      - patterns:
+          - pattern: '{"rules": {..., $K: $V, ...}}'
+          - metavariable-regex:
+              metavariable: $K
+              regex: ^"\.(?:read|write)"$
+          - metavariable-regex:
+              metavariable: $V
+              regex: ^(?:true|"\s*(?:true|now\s*<\s*[0-9]+|auth(?:\.uid)?\s*!==?\s*null)\s*")$
+          - focus-metavariable: $V
