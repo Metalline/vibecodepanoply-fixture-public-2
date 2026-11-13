@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b6 (owned)
+# managed-by: security-gate v0.1.0-b7 (owned)
 """security-gate: the pull request gate. Standard library only, Python 3.11+.
 
 The owned workflow .github/workflows/security-gate.yml runs this file from a
@@ -103,7 +103,7 @@ if __name__ == "__main__" and sys.version_info < (3, 11):
     print("security-gate: INCONCLUSIVE - Python 3.11 or newer is required")
     sys.exit(2)  # EXIT[INCONCLUSIVE]
 
-GATE_VERSION = "0.1.0-b6"
+GATE_VERSION = "0.1.0-b7"
 RECEIPT_SCHEMA = "security-gate/receipt"
 RECEIPT_SCHEMA_VERSION = 4
 FINGERPRINT_SCHEMA = "security-gate/fingerprint"
@@ -355,6 +355,7 @@ class Change:
 
 
 ZERO_OID = "0" * 40
+EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 
 
 def raw_records(out: bytes) -> list[tuple[list[str], list[str], str, bytes]]:
@@ -536,20 +537,24 @@ class Git:
                     changes.append(Change(commit, path, old, oids[-1], i, parents))
         return changes
 
-    def commits_with_additions(self, revs: list[str]) -> int:
-        """Non-merge commits of revs whose diff adds at least one line: the
-        commits gitleaks counts when it reads `git log -p` (it reports fewer
-        for commits that only delete, rename or add binary files)."""
-        out = self.run("log", "--no-merges", "--format=%x01%H", "--numstat", *revs, "--")
-        counted, current = 0, False
-        for line in out.split(b"\n"):
-            if line.startswith(b"\x01"):
-                current = False
-                continue
-            added = line.split(b"\t", 1)[0]
-            if not current and added.isdigit() and int(added) > 0:
-                current = True
-                counted += 1
+    def commits_with_hunks(self, revs: list[str]) -> int:
+        """Non-merge commits of revs whose `git log -p` has a hunk (an added
+        or removed line) in a file the commit does not delete: the commits
+        gitleaks 8.30.1 counts (tests/data/scanners/gitleaks-counts.json).
+        `* diff` of the scratch repository makes no file binary, so a file
+        has a hunk unless its content stays: the same blob after a mode
+        change or a rename, or an empty file created (a type change is a
+        deletion and a creation). A gitlink is a line of its id, whatever
+        the id. Renames are found as git log finds them."""
+        out = self.run("log", "--no-merges", "--format=%x01", "--raw", "--no-abbrev", *revs, "--")
+        counted = 0
+        for commit in out.split(b"\x01")[1:]:
+            for line in commit.split(b"\n"):
+                if line.startswith(b":"):
+                    _, mode, old, new, status = line.split(b"\t", 1)[0].decode("ascii").split(" ")
+                    if status[0] in "AT" and (new != EMPTY_BLOB or mode == "160000") or status[0] in "MR" and old != new:
+                        counted += 1
+                        break
         return counted
 
     def patch(self, a: str, b: str, paths: list[str]) -> bytes:
@@ -1654,9 +1659,10 @@ def judge_gitleaks(report: bytes | None, stderr: str, code: int | None, layout: 
     elif commits == 0:
         problems.append((reason("zero_scanned"), "gitleaks scanned 0 commits"))
     elif commits != expected_commits:
-        problems.append((reason("coverage_gap"), (f"gitleaks scanned {commits} commit(s) with added lines, expected "
-                                                  f"{expected_commits}: {expected_commits - 2} of the pull request, the "
-                                                  f"snapshot of its head tree and the copy of its changes")))
+        problems.append((reason("coverage_gap"), (f"gitleaks scanned {commits} commit(s), expected {expected_commits}: "
+                                                  f"{expected_commits - 2} of the pull request that change a line of a "
+                                                  f"file they do not delete, the snapshot of its head tree and the copy "
+                                                  f"of its changes")))
     # A canary counts only as a finding that fails under the policy, like the
     # canaries of osv-scanner: a threshold above every gitleaks finding would
     # turn gitleaks off while the canaries still looked found.
@@ -1759,7 +1765,7 @@ def run_gitleaks(s: Scan) -> dict:
     parent = hist.commit_tree(nest(hist, before, own, "c"), "security-gate: the pull request before its changes")
     copy = hist.commit_tree(nest(hist, after, own, "c"), "security-gate: the changes of the pull request", (parent,))
     s.canary_commit = snapshot
-    expected = hist.commits_with_additions([s.head, "^" + s.base]) + 2
+    expected = hist.commits_with_hunks([s.head, "^" + s.base]) + 2
     (repo / "objects" / "info" / "alternates").write_text("/sg/pr-objects\n", encoding="utf-8")
     argv = ["git", "--no-banner", "--no-color", "--redact", "--exit-code", "1", "--ignore-gitleaks-allow",
             "--gitleaks-ignore-path", "/tmp", "--log-level", "info", "--report-format", "json",
@@ -4325,7 +4331,7 @@ OWNER_ROLE = 5   # actor_id of the repository role admin, for a bypass of actor_
 # The owned workflow of this release as the pin mask leaves it (mask_pins):
 # sha256 of the template, kept equal to it by a test. A release that changes
 # the workflow, its managed-by line too, changes this value.
-OWNED_WORKFLOW_SHA256 = "sha256:52f568f70307d2a25d78f979aaaadbaeadc31411ddf07ee85e9450fc7019dd26"
+OWNED_WORKFLOW_SHA256 = "sha256:3569c8bd159c3f619796156a660d79d73f254403a5dc39e242d414dbac1c3e8a"
 # A uses: line of the owned workflow pinned to a commit, and its comment:
 # Dependabot moves both. The name of the action is not masked, and the
 # comment only while it is printable ASCII: each line break of YAML but LF (a

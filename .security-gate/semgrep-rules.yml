@@ -1,4 +1,4 @@
-# managed-by: security-gate v0.1.0-b6 (owned)
+# managed-by: security-gate v0.1.0-b7 (owned)
 #
 # The security gate's own Semgrep rules. The gate runs them from the default
 # branch in a Semgrep call of their own, apart from the Semgrep Registry rules
